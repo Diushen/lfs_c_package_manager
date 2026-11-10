@@ -691,15 +691,12 @@ lpm_status lpm_metadata_parse_buffer(const char *data, size_t len,
 /* File input                                                          */
 /* ------------------------------------------------------------------ */
 
-lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
-                                  lpm_meta_error *err)
+lpm_status lpm_read_bounded_fileat(int dirfd, const char *path, size_t max_size,
+                                   char **data, size_t *len, lpm_meta_error *err)
 {
-    /* Room for one byte past the limit, so a file that grew after
-     * fstat() is still detected as too large. */
-    const size_t cap = (size_t)LPM_META_MAX_FILE_SIZE + 1;
     struct stat st;
     char *buf = NULL;
-    size_t total = 0;
+    size_t total = 0, cap;
     int fd;
     lpm_status rc = LPM_OK;
 
@@ -709,7 +706,7 @@ lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
 
     /* O_NOFOLLOW: refuse a symlink as the final component.
      * O_NONBLOCK: opening a FIFO must not hang; fstat rejects it next. */
-    fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
+    fd = openat(dirfd, path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
     if (fd < 0) {
         int e = errno;
         if (e == ENOENT) {
@@ -740,18 +737,21 @@ lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
         rc = LPM_ERR_INVALID;
         goto out;
     }
-    if (st.st_size > (off_t)LPM_META_MAX_FILE_SIZE) {
+    if (st.st_size < 0 || (uintmax_t)st.st_size > (uintmax_t)max_size) {
         lpm_meta_error_set(err, LPM_META_ERR_FILE_TOO_LARGE, 0, NULL,
-                           "metadata is %jd bytes, maximum is %d",
-                           (intmax_t)st.st_size, LPM_META_MAX_FILE_SIZE);
+                           "file is %jd bytes, maximum is %zu",
+                           (intmax_t)st.st_size, max_size);
         rc = LPM_ERR_INVALID;
         goto out;
     }
 
+    /* Size the buffer from fstat (bounded by max_size above) plus one
+     * spare byte: if that byte gets filled, the file grew after fstat. */
+    cap = (size_t)st.st_size + 1;
     buf = malloc(cap + 1);   /* +1 for the convenience NUL */
     if (buf == NULL) {
         lpm_meta_error_set(err, LPM_META_ERR_NOMEM, 0, NULL,
-                           "out of memory reading metadata");
+                           "out of memory reading file");
         rc = LPM_ERR_NOMEM;
         goto out;
     }
@@ -770,10 +770,14 @@ lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
             break;
         total += (size_t)n;
     }
-    if (total > (size_t)LPM_META_MAX_FILE_SIZE) {
-        lpm_meta_error_set(err, LPM_META_ERR_FILE_TOO_LARGE, 0, NULL,
-                           "metadata exceeds %d bytes", LPM_META_MAX_FILE_SIZE);
-        rc = LPM_ERR_INVALID;
+    if (total == cap) {
+        if (total > max_size)
+            lpm_meta_error_set(err, LPM_META_ERR_FILE_TOO_LARGE, 0, NULL,
+                               "file exceeds %zu bytes", max_size);
+        else
+            lpm_meta_error_set(err, LPM_META_ERR_IO, 0, NULL,
+                               "file changed while it was being read");
+        rc = total > max_size ? LPM_ERR_INVALID : LPM_ERR_IO;
         goto out;
     }
 
@@ -786,6 +790,19 @@ out:
     free(buf);
     close(fd);
     return rc;
+}
+
+lpm_status lpm_metadata_read_fileat(int dirfd, const char *path, char **data,
+                                    size_t *len, lpm_meta_error *err)
+{
+    return lpm_read_bounded_fileat(dirfd, path, LPM_META_MAX_FILE_SIZE,
+                                   data, len, err);
+}
+
+lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
+                                  lpm_meta_error *err)
+{
+    return lpm_metadata_read_fileat(AT_FDCWD, path, data, len, err);
 }
 
 lpm_status lpm_metadata_parse_file(const char *path, lpm_meta_profile profile,
@@ -802,4 +819,240 @@ lpm_status lpm_metadata_parse_file(const char *path, lpm_meta_profile profile,
     rc = lpm_metadata_parse_buffer(data, len, profile, out, err);
     free(data);
     return rc;
+}
+
+/* ------------------------------------------------------------------ */
+/* Serialisation (installed-database records)                          */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A description is written verbatim after "description=". It must read
+ * back as exactly the same string, so reject anything the parser would
+ * reject or silently change: line breaks (which would inject new
+ * fields), other control characters, non-ASCII, and leading/trailing
+ * blanks (which the parser trims).
+ */
+static lpm_status check_description_text(const char *d, lpm_meta_error *err)
+{
+    size_t i, len = strnlen(d, LPM_META_MAX_DESC_LEN + 1);
+
+    if (len > LPM_META_MAX_DESC_LEN) {
+        lpm_meta_error_set(err, LPM_META_ERR_TOO_LONG, 0, "description",
+                           "description is longer than %d characters",
+                           LPM_META_MAX_DESC_LEN);
+        return LPM_ERR_INVALID;
+    }
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)d[i];
+        if (c == '\t' || (c >= 0x20 && c < 0x7f))
+            continue;
+        lpm_meta_error_set(err, c >= 0x80 ? LPM_META_ERR_ENCODING
+                                          : LPM_META_ERR_CONTROL_CHAR,
+                           0, "description",
+                           "description contains byte 0x%02x at column %zu "
+                           "(only printable ASCII and TAB can be stored)",
+                           c, i + 1);
+        return LPM_ERR_INVALID;
+    }
+    if (len > 0 && (d[0] == ' ' || d[0] == '\t' ||
+                    d[len - 1] == ' ' || d[len - 1] == '\t')) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "description",
+                           "description has leading or trailing whitespace, "
+                           "which would not survive a round trip");
+        return LPM_ERR_INVALID;
+    }
+    return LPM_OK;
+}
+
+static lpm_status check_package_fields(const lpm_package *pkg,
+                                       lpm_meta_profile profile,
+                                       lpm_meta_error *err)
+{
+    size_t i, j;
+
+    if (!lpm_is_valid_package_name(pkg->name)) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "name",
+                           "missing or invalid package name");
+        return LPM_ERR_INVALID;
+    }
+    if (!lpm_is_valid_version(pkg->version)) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "version",
+                           "missing or invalid version");
+        return LPM_ERR_INVALID;
+    }
+    if (pkg->description != NULL &&
+        check_description_text(pkg->description, err) != LPM_OK)
+        return LPM_ERR_INVALID;
+
+    if (pkg->dependency_count > LPM_META_MAX_DEPENDS) {
+        lpm_meta_error_set(err, LPM_META_ERR_TOO_MANY_DEPENDS, 0, "depends",
+                           "too many dependencies (maximum is %d)",
+                           LPM_META_MAX_DEPENDS);
+        return LPM_ERR_INVALID;
+    }
+    if (pkg->dependency_count > 0 && pkg->dependencies == NULL) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "depends",
+                           "dependency count is set but the array is missing");
+        return LPM_ERR_INVALID;
+    }
+    for (i = 0; i < pkg->dependency_count; i++) {
+        const lpm_dependency *d = &pkg->dependencies[i];
+
+        if (!lpm_is_valid_package_name(d->name) ||
+            !lpm_is_valid_version(d->version) ||
+            (d->op != LPM_DEP_EXACT && d->op != LPM_DEP_MINIMUM)) {
+            lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "depends",
+                               "dependency %zu is invalid", i + 1);
+            return LPM_ERR_INVALID;
+        }
+        if (strcmp(d->name, pkg->name) == 0) {
+            lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "depends",
+                               "package '%s' cannot depend on itself", pkg->name);
+            return LPM_ERR_INVALID;
+        }
+        for (j = 0; j < i; j++) {
+            if (strcmp(pkg->dependencies[j].name, d->name) == 0) {
+                lpm_meta_error_set(err, LPM_META_ERR_DUPLICATE_DEPEND, 0,
+                                   "depends", "duplicate dependency on '%s'",
+                                   d->name);
+                return LPM_ERR_INVALID;
+            }
+        }
+    }
+
+    if (pkg->has_manifest_sha256) {
+        if (!lpm_is_valid_sha256_hex(pkg->manifest_sha256)) {
+            lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0,
+                               "manifest_sha256",
+                               "manifest_sha256 is not 64 lowercase hex digits");
+            return LPM_ERR_INVALID;
+        }
+    } else if (profile == LPM_META_DISTRIBUTABLE) {
+        lpm_meta_error_set(err, LPM_META_ERR_MISSING_FIELD, 0, "manifest_sha256",
+                           "missing required field 'manifest_sha256'");
+        return LPM_ERR_INVALID;
+    }
+    return LPM_OK;
+}
+
+static bool opt_str_eq(const char *a, const char *b)
+{
+    if (a == NULL || b == NULL)
+        return a == b;
+    return strcmp(a, b) == 0;
+}
+
+bool lpm_package_equal(const lpm_package *a, const lpm_package *b)
+{
+    size_t i;
+
+    if (!opt_str_eq(a->name, b->name) || !opt_str_eq(a->version, b->version) ||
+        !opt_str_eq(a->description, b->description) ||
+        a->dependency_count != b->dependency_count ||
+        a->has_manifest_sha256 != b->has_manifest_sha256)
+        return false;
+    if (a->has_manifest_sha256 &&
+        strcmp(a->manifest_sha256, b->manifest_sha256) != 0)
+        return false;
+    for (i = 0; i < a->dependency_count; i++) {
+        const lpm_dependency *da = &a->dependencies[i];
+        const lpm_dependency *db = &b->dependencies[i];
+        if (da->op != db->op || !opt_str_eq(da->name, db->name) ||
+            !opt_str_eq(da->version, db->version))
+            return false;
+    }
+    return true;
+}
+
+/* Append a string to a buffer whose total size was computed up front. */
+static void put(char *buf, size_t *pos, const char *s)
+{
+    size_t n = strlen(s);
+    memcpy(buf + *pos, s, n);
+    *pos += n;
+}
+
+lpm_status lpm_metadata_serialize(const lpm_package *pkg, lpm_meta_profile profile,
+                                  char **out, size_t *out_len, lpm_meta_error *err)
+{
+    size_t i, size, pos = 0;
+    char *buf;
+    lpm_package check;
+    lpm_status rc;
+
+    *out = NULL;
+    *out_len = 0;
+    error_clear(err);
+    if (pkg == NULL) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, NULL, "no package");
+        return LPM_ERR_INVALID;
+    }
+    rc = check_package_fields(pkg, profile, err);
+    if (rc != LPM_OK)
+        return rc;
+
+    /* Exact size. Every field is bounded above (64 + 64 + 1024 +
+     * 128 * (64 + 2 + 64) + 64 plus keys), so this is far below both
+     * SIZE_MAX and LPM_META_MAX_FILE_SIZE; no overflow is possible. */
+    size = strlen("name=\n") + strlen(pkg->name) +
+           strlen("version=\n") + strlen(pkg->version);
+    if (pkg->description != NULL)
+        size += strlen("description=\n") + strlen(pkg->description);
+    for (i = 0; i < pkg->dependency_count; i++)
+        size += strlen("depends=\n") + strlen(pkg->dependencies[i].name) +
+                strlen(lpm_dep_operator_str(pkg->dependencies[i].op)) +
+                strlen(pkg->dependencies[i].version);
+    if (pkg->has_manifest_sha256)
+        size += strlen("manifest_sha256=\n") + LPM_SHA256_HEX_LEN;
+
+    buf = malloc(size + 1);
+    if (buf == NULL) {
+        lpm_meta_error_set(err, LPM_META_ERR_NOMEM, 0, NULL,
+                           "out of memory serialising metadata");
+        return LPM_ERR_NOMEM;
+    }
+
+    /* Fixed field order, dependencies in their given order: the same
+     * package always produces the same bytes. */
+    put(buf, &pos, "name=");
+    put(buf, &pos, pkg->name);
+    put(buf, &pos, "\nversion=");
+    put(buf, &pos, pkg->version);
+    put(buf, &pos, "\n");
+    if (pkg->description != NULL) {
+        put(buf, &pos, "description=");
+        put(buf, &pos, pkg->description);
+        put(buf, &pos, "\n");
+    }
+    for (i = 0; i < pkg->dependency_count; i++) {
+        put(buf, &pos, "depends=");
+        put(buf, &pos, pkg->dependencies[i].name);
+        put(buf, &pos, lpm_dep_operator_str(pkg->dependencies[i].op));
+        put(buf, &pos, pkg->dependencies[i].version);
+        put(buf, &pos, "\n");
+    }
+    if (pkg->has_manifest_sha256) {
+        put(buf, &pos, "manifest_sha256=");
+        put(buf, &pos, pkg->manifest_sha256);
+        put(buf, &pos, "\n");
+    }
+    buf[pos] = '\0';
+
+    /* Safety net: the record must parse back, with the strict parser,
+     * into exactly the package we were given. If it ever did not, the
+     * database would store something other than what was validated. */
+    rc = lpm_metadata_parse_buffer(buf, pos, profile, &check, err);
+    if (rc == LPM_OK && !lpm_package_equal(pkg, &check)) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, NULL,
+                           "serialised record does not round-trip");
+        rc = LPM_ERR_INVALID;
+    }
+    lpm_package_free(&check);
+    if (rc != LPM_OK) {
+        free(buf);
+        return rc;
+    }
+    *out = buf;
+    *out_len = pos;
+    return LPM_OK;
 }
