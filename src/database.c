@@ -27,33 +27,46 @@ char *lpm_db_installed_dir(const lpm_config *cfg)
     return installed;
 }
 
-/*
- * TEMPORARY (Milestone 1): pull the value of "version=" out of a .meta
- * file. Milestone 2 replaces this with the real metadata parser.
- * Returns a malloc'd string, or NULL if absent / on error.
- */
-static char *read_version_field(const char *meta_path)
+lpm_status lpm_db_load_package(const lpm_config *cfg, const char *name,
+                               lpm_package *out, lpm_meta_error *err)
 {
-    FILE *fp;
-    char *line = NULL;
-    size_t cap = 0;
-    char *result = NULL;
+    /* name is validated first, so this buffer always fits. */
+    char fname[LPM_MAX_NAME_LEN + sizeof(LPM_META_SUFFIX)];
+    char *installed_dir, *path;
+    lpm_status rc;
 
-    fp = fopen(meta_path, "r");
-    if (fp == NULL)
-        return NULL;
+    lpm_package_init(out);
 
-    while (getline(&line, &cap, fp) != -1) {
-        char *trimmed = lpm_trim(line);
-        if (strncmp(trimmed, "version=", 8) == 0) {
-            result = lpm_strdup(lpm_trim(trimmed + 8));
-            break;
-        }
+    /* Defence in depth: a name like "../x" must never become a path. */
+    if (!lpm_is_valid_package_name(name)) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "name",
+                           "invalid package name");
+        return LPM_ERR_INVALID;
     }
+    snprintf(fname, sizeof(fname), "%s%s", name, LPM_META_SUFFIX);
 
-    free(line);
-    fclose(fp);
-    return result;
+    installed_dir = lpm_db_installed_dir(cfg);
+    if (installed_dir == NULL)
+        return LPM_ERR_NOMEM;
+    path = lpm_path_join(installed_dir, fname);
+    free(installed_dir);
+    if (path == NULL)
+        return LPM_ERR_NOMEM;
+
+    rc = lpm_metadata_parse_file(path, LPM_META_INSTALLED, out, err);
+    free(path);
+    if (rc != LPM_OK)
+        return rc;
+
+    /* hello.meta must describe "hello", or lookups by name would lie. */
+    if (strcmp(out->name, name) != 0) {
+        lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "name",
+                           "record declares name '%s', which does not match "
+                           "its database filename '%s'", out->name, fname);
+        lpm_package_free(out);
+        return LPM_ERR_INVALID;
+    }
+    return LPM_OK;
 }
 
 /* Append an entry, doubling capacity as needed. Takes ownership of
@@ -89,13 +102,21 @@ static int compare_entries(const void *a, const void *b)
  * Handle one directory entry: accept "<valid-name>.meta" regular files,
  * ignore anything else. Returns LPM_OK for both accepted and skipped
  * entries; only allocation failure is an error.
+ *
+ * Compatibility policy for damaged records (e.g. Milestone 1 data with
+ * no version= line): the record is parsed strictly; if that fails, the
+ * package is still listed, because its files may be installed, but with
+ * version "?" plus a warning saying exactly what is wrong. No version
+ * is ever invented, and the strict parser is not weakened.
  */
-static lpm_status consider_entry(const char *installed_dir, const char *fname,
-                                 lpm_db_list *out)
+static lpm_status consider_entry(const lpm_config *cfg, const char *installed_dir,
+                                 const char *fname, lpm_db_list *out)
 {
     size_t name_len;
     char *name = NULL, *path = NULL, *version = NULL;
     struct stat st;
+    lpm_package pkg;
+    lpm_meta_error err;
     lpm_status rc = LPM_OK;
 
     if (fname[0] == '.' || !lpm_has_suffix(fname, LPM_META_SUFFIX))
@@ -125,13 +146,26 @@ static lpm_status consider_entry(const char *installed_dir, const char *fname,
         goto out;
     }
 
-    version = read_version_field(path);
-    if (version == NULL) {
+    rc = lpm_db_load_package(cfg, name, &pkg, &err);
+    if (rc == LPM_OK) {
+        version = pkg.version;   /* take ownership of the version string */
+        pkg.version = NULL;
+        lpm_package_free(&pkg);
+    } else if (rc == LPM_ERR_NOMEM) {
+        goto out;
+    } else if (rc == LPM_ERR_NOT_FOUND) {
+        rc = LPM_OK;             /* removed since readdir(): not installed */
+        goto out;
+    } else {
+        char msg[512];
+        lpm_meta_error_format(&err, path, msg, sizeof(msg));
+        lpm_warn("damaged database record %s (listed with version '?')", msg);
         version = lpm_strdup("?");
         if (version == NULL) {
             rc = LPM_ERR_NOMEM;
             goto out;
         }
+        rc = LPM_OK;
     }
 
     rc = list_append(out, name, version);
@@ -179,7 +213,7 @@ lpm_status lpm_db_list_installed(const lpm_config *cfg, lpm_db_list *out,
 
     errno = 0;
     while ((de = readdir(dir)) != NULL) {
-        rc = consider_entry(installed_dir, de->d_name, out);
+        rc = consider_entry(cfg, installed_dir, de->d_name, out);
         if (rc != LPM_OK)
             break;
         errno = 0;

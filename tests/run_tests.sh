@@ -1,5 +1,5 @@
 #!/bin/bash
-# Milestone 1 CLI tests. Usage: tests/run_tests.sh ./lpm
+# CLI tests (Milestones 1-2). Usage: tests/run_tests.sh ./lpm
 #
 # Every test runs against a throwaway --root directory, never against /.
 
@@ -74,6 +74,39 @@ run list extra;           check "list rejects extra arguments"   2 err "too many
 run --root "$EMPTY" install foo.pkg
                           check "install not implemented yet"    1 err "not implemented"
 run install;              check "install requires argument"      2 err "requires an argument"
+
+# --- Milestone 2: metadata parser through the CLI ---------------------
+# A separate root, so the Milestone 1 fixtures and assertions above stay
+# exactly as they were.
+INFO="$WORK/root-info"
+mkdir -p "$INFO/var/lib/lpm/installed"
+D="$INFO/var/lib/lpm/installed"
+HEX=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+printf 'name=hello\nversion=1.2.0\ndescription=A simple hello world program\ndepends=libfoo>=1.0\ndepends=libbar=2.1\nmanifest_sha256=%s\n' "$HEX" > "$D/hello.meta"
+printf 'name=libfoo\nversion=1.0\n'      > "$D/libfoo.meta"
+printf 'name=broken\nversion=1..2\n'     > "$D/broken.meta"
+printf 'name=other\nversion=1.0\n'       > "$D/mismatch.meta"
+ln -s hello.meta "$D/linked.meta"
+
+echo "Running Milestone 2 CLI tests"
+run --root "$INFO" info hello;   check "info: shows version"            0 out "^Version: *1.2.0$"
+run --root "$INFO" info hello;   check "info: shows description"        0 out "^Description: *A simple hello world program$"
+run --root "$INFO" info hello;   check "info: shows >= dependency"      0 out "libfoo >= 1.0"
+run --root "$INFO" info hello;   check "info: shows = dependency"       0 out "libbar = 2.1"
+run --root "$INFO" info hello;   check "info: shows manifest digest"    0 out "^Manifest SHA256: $HEX$"
+run --root "$INFO" info libfoo;  check "info: no dependencies"          0 out "^Dependencies: *(none)$"
+run --root "$INFO" info libfoo;  check "info: no digest recorded"       0 out "(not recorded)"
+run --root "$INFO" info nothere; check "info: missing package"          1 err "package 'nothere' is not installed"
+run --root "$NODB" info hello;   check "info: no database"              1 err "is not installed"
+run --root "$INFO" info ../etc;  check "info: rejects unsafe name"      1 err "invalid package name"
+run --root "$INFO" info broken;  check "info: damaged record is error"  1 err "broken.meta:2: invalid version '1..2'"
+run --root "$INFO" info mismatch; check "info: name/filename mismatch"  1 err "does not match its database filename"
+run --root "$INFO" info linked;  check "info: refuses symlinked record" 1 err "symbolic link"
+run info;                        check "info requires argument"         2 err "requires an argument"
+run --root "$INFO" list;         check "list: damaged record shown ?"   0 out "broken  *?"
+run --root "$INFO" list;         check "list: damaged record warning"   0 err "damaged database record .*broken.meta:2"
+run --root "$INFO" list;         check "list: valid record version"     0 out "hello  *1.2.0"
+run --root "$FULL" list;         check "list: legacy record explained"  0 err "nover.meta: missing required field 'version'"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"
