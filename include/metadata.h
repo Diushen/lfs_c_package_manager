@@ -100,7 +100,16 @@ typedef enum {
     LPM_META_ERR_INVALID_VALUE,    /* value fails validation             */
     LPM_META_ERR_TOO_LONG,         /* value exceeds its length limit     */
     LPM_META_ERR_TOO_MANY_DEPENDS, /* > LPM_META_MAX_DEPENDS             */
-    LPM_META_ERR_DUPLICATE_DEPEND  /* same dependency name twice         */
+    LPM_META_ERR_DUPLICATE_DEPEND, /* same dependency name twice         */
+    /* Added in Milestone 3. The error structure is shared by every
+     * database record format (metadata and file lists) and by the
+     * database operations themselves, so callers handle one type. */
+    LPM_META_ERR_INVALID_PATH,     /* malformed owned-file path          */
+    LPM_META_ERR_DUPLICATE_PATH,   /* same path listed twice             */
+    LPM_META_ERR_PATH_CONFLICT,    /* path is both a file and a parent   */
+    LPM_META_ERR_TOO_MANY_FILES,   /* > LPM_FILES_MAX_ENTRIES            */
+    LPM_META_ERR_UNTRUSTED,        /* unsafe owner/permissions/symlink   */
+    LPM_META_ERR_STATE             /* operation not valid in this state  */
 } lpm_meta_error_code;
 
 /*
@@ -177,6 +186,49 @@ lpm_status lpm_metadata_read_file(const char *path, char **data, size_t *len,
  * guarantees as lpm_metadata_parse_buffer(). */
 lpm_status lpm_metadata_parse_file(const char *path, lpm_meta_profile profile,
                                    lpm_package *out, lpm_meta_error *err);
+
+/*
+ * As lpm_metadata_read_file(), but path is resolved relative to the open
+ * directory dirfd (or the working directory for AT_FDCWD). Used by the
+ * database, which never builds absolute paths for files it trusts.
+ */
+lpm_status lpm_metadata_read_fileat(int dirfd, const char *path, char **data,
+                                    size_t *len, lpm_meta_error *err);
+
+/*
+ * The general reader behind both functions above: same checks, with a
+ * caller-chosen size limit (file lists allow more than 64 KiB). The
+ * buffer is sized from fstat, never larger than max_size + 2 bytes.
+ */
+lpm_status lpm_read_bounded_fileat(int dirfd, const char *path, size_t max_size,
+                                   char **data, size_t *len, lpm_meta_error *err);
+
+/* ---- Serialisation (Milestone 3) ------------------------------------ */
+
+/*
+ * Write a package as metadata text that the strict parser reads back as
+ * exactly the same package.
+ *
+ * Every field is validated first with the parser's own rules; nothing
+ * is truncated, trimmed or escaped: a value that cannot be stored
+ * exactly (e.g. a description containing a newline, which would inject
+ * a field) is rejected with LPM_ERR_INVALID. Output is deterministic:
+ * fixed field order, dependencies in their given order, LF endings.
+ * As a final safety net the text is parsed again with `profile` and
+ * compared with *pkg.
+ *
+ * Used for INSTALLED database records. Serialising does NOT make a
+ * record trustworthy, and a distributable package's signed metadata
+ * must never be replaced by a re-serialised copy (see TRUST above).
+ *
+ * On success *out is a malloc'd NUL-terminated buffer of *out_len bytes
+ * (caller frees). On failure *out is NULL and *err says why.
+ */
+lpm_status lpm_metadata_serialize(const lpm_package *pkg, lpm_meta_profile profile,
+                                  char **out, size_t *out_len, lpm_meta_error *err);
+
+/* Field-by-field equality, including dependency order. */
+bool lpm_package_equal(const lpm_package *a, const lpm_package *b);
 
 /* ---- Field validators (reusable by later milestones) ---------------- */
 

@@ -18,6 +18,7 @@ static lpm_status cmd_help(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_version(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_list(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_not_implemented(const lpm_config *cfg, int argc, char **argv);
 
 static const lpm_command commands[] = {
@@ -29,7 +30,7 @@ static const lpm_command commands[] = {
     { "verify",  "<file.pkg>",   "Verify a package's checksum/signature",  1, 1, 0, cmd_not_implemented },
     { "install", "<file.pkg>",   "Install a local package archive",        1, 1, 0, cmd_not_implemented },
     { "remove",  "<package>",    "Remove an installed package",            1, 1, 0, cmd_not_implemented },
-    { "check",   "",             "Check database consistency",             0, 0, 0, cmd_not_implemented },
+    { "check",   "",             "Check database consistency",             0, 0, 1, cmd_check },
 };
 
 #define COMMAND_COUNT (sizeof(commands) / sizeof(commands[0]))
@@ -212,6 +213,61 @@ static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv)
            pkg.has_manifest_sha256 ? pkg.manifest_sha256 : "(not recorded)");
 
     lpm_package_free(&pkg);
+    return LPM_OK;
+}
+
+static void print_check_problem(void *ctx, lpm_check_kind kind,
+                                const char *subject, const char *detail)
+{
+    (void)ctx;
+    printf("PROBLEM  [%s] %s: %s\n", lpm_check_kind_str(kind), subject, detail);
+}
+
+/*
+ * Read-only: reports problems and never repairs or deletes anything, so
+ * a suspicious entry stays available for inspection. Exit status 1 when
+ * problems are found, so scripts can use it.
+ */
+static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv)
+{
+    lpm_check_summary sum;
+    lpm_meta_error err;
+    lpm_status rc;
+    lpm_db db;
+
+    (void)argc; (void)argv;
+
+    /* Shared lock, so no writer changes the database mid-check; wait a
+     * few seconds for a writer that is finishing. */
+    rc = lpm_db_open(cfg, LPM_DB_READ, 5000, &db, &err);
+    if (rc == LPM_ERR_NOT_FOUND) {
+        printf("No package database under '%s': nothing to check.\n", cfg->root);
+        return LPM_OK;
+    }
+    if (rc != LPM_OK) {
+        lpm_error("cannot open the package database: %s", err.message);
+        return rc;
+    }
+
+    printf("Checking package database in '%s' (%s)\n", cfg->root, LPM_DB_SUBDIR);
+    rc = lpm_db_check(&db, print_check_problem, NULL, &sum, &err);
+    lpm_db_close(&db);
+    if (rc != LPM_OK) {
+        lpm_error("check did not complete: %s", err.message);
+        return rc;
+    }
+
+    printf("Checked %zu record%s (%zu valid) owning %zu file%s.\n",
+           sum.records, sum.records == 1 ? "" : "s", sum.packages,
+           sum.owned_files, sum.owned_files == 1 ? "" : "s");
+    if (sum.problems > 0) {
+        printf("%zu problem%s found. Nothing was changed; inspect the entries "
+               "above.\n", sum.problems, sum.problems == 1 ? "" : "s");
+        return LPM_ERR_INVALID;
+    }
+    printf("No problems found by the implemented checks.\n");
+    printf("Not checked yet: whether owned files exist on disk or match their "
+           "checksums (later milestones).\n");
     return LPM_OK;
 }
 

@@ -20,6 +20,8 @@
 #define LPM_DB_INSTALLED_DIR  "installed"   /* <name>.meta  */
 #define LPM_DB_FILES_DIR      "files"       /* <name>.list  */
 #define LPM_META_SUFFIX       ".meta"
+#define LPM_LIST_SUFFIX       ".list"
+#define LPM_DB_LOCK_FILE      "lock"        /* flock() target  */
 
 /* Upper bound for a package name; keeps names sane and filenames short. */
 #define LPM_MAX_NAME_LEN   64
@@ -36,7 +38,10 @@ typedef enum {
     LPM_ERR_IO,               /* filesystem / read / write failure     */
     LPM_ERR_NOT_FOUND,        /* requested item does not exist         */
     LPM_ERR_INVALID,          /* malformed input / failed validation   */
-    LPM_ERR_NOT_IMPLEMENTED   /* command planned for a later milestone */
+    LPM_ERR_NOT_IMPLEMENTED,  /* command planned for a later milestone */
+    LPM_ERR_EXISTS,           /* item already exists (e.g. registered) */
+    LPM_ERR_BUSY,             /* database locked by another process    */
+    LPM_ERR_CONFLICT          /* file already owned by another package */
 } lpm_status;
 
 /* Runtime configuration built from global command-line options. */

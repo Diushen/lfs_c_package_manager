@@ -1,12 +1,14 @@
 # LPM - LFS Package Manager
 #
-#   make            release build (-O2)
+#   make            release build (-O2) of lpm
 #   make debug      -O0 -g with AddressSanitizer + UBSan (sticky until
 #                   `make clean`, so a following `make test` uses it too)
-#   make test       build, then run the CLI tests and the unit tests
+#   make test       build, then run the CLI tests and all unit tests
 #   make unit-test  build and run only the unit tests
+#   make demo       build only build/lpm-db-demo (Milestone 3 demonstration)
 #   make clean      remove build artefacts
-#   make install    install binary to $(DESTDIR)$(PREFIX)/bin
+#   make install    install the lpm binary to $(DESTDIR)$(PREFIX)/bin
+#                   (the demo and test programs are never installed)
 
 CC       = gcc
 PREFIX   = /usr/local
@@ -31,17 +33,27 @@ BIN  = lpm
 SRC  = $(wildcard src/*.c)
 OBJ  = $(SRC:src/%.c=build/%.o)
 
+# Library objects = everything except the CLI front end. Test and demo
+# programs link only what they exercise.
+CORE_OBJ = build/util.o build/metadata.o build/version.o build/filelist.o
+DB_OBJ   = $(CORE_OBJ) build/database.o
+
 # Unit tests live in tests/ (never matched by the src/*.c wildcard, so
-# they cannot end up in the lpm binary). The metadata test links only
-# the modules it exercises: the parser has no database/CLI dependency.
-TEST_BIN  = build/test_metadata
-TEST_OBJ  = build/test_metadata.o build/metadata.o build/util.o
-# GNU ld --wrap lets the test inject malloc/calloc/realloc failures.
-TEST_WRAP = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
+# they cannot end up in the lpm binary).
+TEST_BIN      = build/test_metadata build/test_version build/test_filelist \
+                build/test_database
+DEMO_BIN      = build/lpm-db-demo
+# GNU ld --wrap lets a test intercept a function to inject failures:
+# allocation failures everywhere, and system-call failures (short
+# writes, EINTR, ENOSPC, EIO, ...) for the database test.
+ALLOC_WRAP    = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
+SYSCALL_WRAP  = -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=renameat \
+                -Wl,--wrap=openat -Wl,--wrap=unlinkat -Wl,--wrap=mkdirat \
+                -Wl,--wrap=fchmod -Wl,--wrap=close -Wl,--wrap=flock
 
-DEP  = $(OBJ:.o=.d) build/test_metadata.d
+DEP  = $(OBJ:.o=.d) $(TEST_BIN:=.d) build/lpm-db-demo.d
 
-.PHONY: all debug test unit-test clean install
+.PHONY: all debug test unit-test demo clean install
 
 all: $(BIN)
 
@@ -54,8 +66,25 @@ build/%.o: src/%.c | build
 build/test_%.o: tests/test_%.c | build
 	$(CC) $(LPM_CPPFLAGS) $(CPPFLAGS) $(LPM_CFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
 
-$(TEST_BIN): $(TEST_OBJ)
-	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(TEST_WRAP) -o $@ $(TEST_OBJ) $(LDLIBS)
+build/lpm-db-demo.o: tools/lpm-db-demo.c | build
+	$(CC) $(LPM_CPPFLAGS) $(CPPFLAGS) $(LPM_CFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+build/test_metadata: build/test_metadata.o build/metadata.o build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) -o $@ $^ $(LDLIBS)
+
+build/test_version: build/test_version.o build/version.o build/metadata.o build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+build/test_filelist: build/test_filelist.o build/filelist.o build/metadata.o build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) -o $@ $^ $(LDLIBS)
+
+build/test_database: build/test_database.o $(DB_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(SYSCALL_WRAP) -o $@ $^ $(LDLIBS)
+
+$(DEMO_BIN): build/lpm-db-demo.o $(DB_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
+
+demo: $(DEMO_BIN)
 
 build:
 	mkdir -p build
@@ -64,14 +93,20 @@ debug:
 	$(MAKE) clean
 	mkdir -p build
 	printf 'CFLAGS = -O0 -g %s\nLDFLAGS = %s\n' '$(SANITIZE)' '$(SANITIZE)' > build/config.mk
-	$(MAKE) all $(TEST_BIN)
+	$(MAKE) all $(TEST_BIN) $(DEMO_BIN)
 
-test: $(BIN) $(TEST_BIN)
-	bash tests/run_tests.sh ./$(BIN)
-	./$(TEST_BIN) tests/fixtures
+test: $(BIN) $(TEST_BIN) $(DEMO_BIN)
+	bash tests/run_tests.sh ./$(BIN) ./$(DEMO_BIN)
+	./build/test_metadata tests/fixtures
+	./build/test_version
+	./build/test_filelist
+	./build/test_database
 
 unit-test: $(TEST_BIN)
-	./$(TEST_BIN) tests/fixtures
+	./build/test_metadata tests/fixtures
+	./build/test_version
+	./build/test_filelist
+	./build/test_database
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)

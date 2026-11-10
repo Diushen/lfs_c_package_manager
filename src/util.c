@@ -140,6 +140,9 @@ const char *lpm_status_str(lpm_status status)
     case LPM_ERR_NOT_FOUND:       return "not found";
     case LPM_ERR_INVALID:         return "invalid input";
     case LPM_ERR_NOT_IMPLEMENTED: return "not implemented";
+    case LPM_ERR_EXISTS:          return "already exists";
+    case LPM_ERR_BUSY:            return "database is locked";
+    case LPM_ERR_CONFLICT:        return "file ownership conflict";
     }
     return "unknown error";
 }
