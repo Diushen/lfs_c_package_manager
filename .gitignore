@@ -1,0 +1,9 @@
+# build output
+/lpm
+/build/
+*.o
+*.d
+
+# local test/demo roots
+/demo-root/
+/test-root/
