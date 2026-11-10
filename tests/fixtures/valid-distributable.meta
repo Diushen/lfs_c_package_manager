@@ -1,0 +1,6 @@
+name=hello
+version=1.2.0
+description=A simple hello world program
+depends=libfoo>=1.0
+depends=libbar=2.1
+manifest_sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

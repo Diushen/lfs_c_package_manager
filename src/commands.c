@@ -7,14 +7,17 @@
  */
 #include "commands.h"
 #include "database.h"
+#include "metadata.h"
 #include "util.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static lpm_status cmd_help(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_version(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_list(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_not_implemented(const lpm_config *cfg, int argc, char **argv);
 
 static const lpm_command commands[] = {
@@ -22,7 +25,7 @@ static const lpm_command commands[] = {
     { "help",    "",             "Show this help",                         0, 0, 1, cmd_help },
     { "version", "",             "Show version information",               0, 0, 1, cmd_version },
     { "list",    "",             "List installed packages",                0, 0, 1, cmd_list },
-    { "info",    "<package>",    "Show details of an installed package",   1, 1, 0, cmd_not_implemented },
+    { "info",    "<package>",    "Show details of an installed package",   1, 1, 1, cmd_info },
     { "verify",  "<file.pkg>",   "Verify a package's checksum/signature",  1, 1, 0, cmd_not_implemented },
     { "install", "<file.pkg>",   "Install a local package archive",        1, 1, 0, cmd_not_implemented },
     { "remove",  "<package>",    "Remove an installed package",            1, 1, 0, cmd_not_implemented },
@@ -144,6 +147,71 @@ static lpm_status cmd_list(const lpm_config *cfg, int argc, char **argv)
         printf("  %-*s  %s\n", width, list.items[i].name, list.items[i].version);
 
     lpm_db_list_free(&list);
+    return LPM_OK;
+}
+
+/*
+ * Unlike `list`, `info` is strict: a damaged record is an error, because
+ * printing partial details would present unverified data as fact.
+ */
+static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv)
+{
+    const char *name = argv[1];
+    lpm_package pkg;
+    lpm_meta_error err;
+    lpm_status rc;
+    size_t i;
+
+    (void)argc;
+
+    if (!lpm_is_valid_package_name(name)) {
+        lpm_error("invalid package name '%.*s' (use a-z 0-9 + . _ - and start "
+                  "with a letter or digit)", LPM_MAX_NAME_LEN, name);
+        return LPM_ERR_INVALID;
+    }
+
+    rc = lpm_db_load_package(cfg, name, &pkg, &err);
+    if (rc == LPM_ERR_NOT_FOUND) {
+        lpm_error("package '%s' is not installed", name);
+        return rc;
+    }
+    if (rc != LPM_OK) {
+        char msg[512];
+        char *dir = lpm_db_installed_dir(cfg);
+        char source[LPM_MAX_NAME_LEN + sizeof(LPM_META_SUFFIX)];
+
+        /* Name the file the way a user would find it on disk. */
+        snprintf(source, sizeof(source), "%s%s", name, LPM_META_SUFFIX);
+        if (rc == LPM_ERR_NOMEM) {
+            lpm_error("out of memory reading package '%s'", name);
+        } else {
+            char *path = dir ? lpm_path_join(dir, source) : NULL;
+            lpm_meta_error_format(&err, path ? path : source, msg, sizeof(msg));
+            lpm_error("damaged database record %s", msg);
+            free(path);
+        }
+        free(dir);
+        return rc;
+    }
+
+    printf("Name:            %s\n", pkg.name);
+    printf("Version:         %s\n", pkg.version);
+    printf("Description:     %s\n",
+           (pkg.description && pkg.description[0]) ? pkg.description : "(none)");
+    if (pkg.dependency_count == 0) {
+        printf("Dependencies:    (none)\n");
+    } else {
+        for (i = 0; i < pkg.dependency_count; i++) {
+            printf("%-17s%s %s %s\n", i == 0 ? "Dependencies:" : "",
+                   pkg.dependencies[i].name,
+                   lpm_dep_operator_str(pkg.dependencies[i].op),
+                   pkg.dependencies[i].version);
+        }
+    }
+    printf("Manifest SHA256: %s\n",
+           pkg.has_manifest_sha256 ? pkg.manifest_sha256 : "(not recorded)");
+
+    lpm_package_free(&pkg);
     return LPM_OK;
 }
 
