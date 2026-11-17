@@ -16,12 +16,22 @@ PREFIX   = /usr/local
 # Flags the project always needs live in their own variables, so that
 # overriding CFLAGS on the command line (e.g. `make CFLAGS=-g`) cannot
 # silently drop the language standard or the warnings.
-LPM_CPPFLAGS = -Iinclude -D_POSIX_C_SOURCE=200809L
+# External libraries (Milestone 4): libarchive reads packages, libcrypto
+# (OpenSSL) computes SHA-256. pkg-config / pkgconf is used when present;
+# otherwise the plain library names are used.
+PKG_CONFIG    ?= pkg-config
+ARCHIVE_CFLAGS := $(shell $(PKG_CONFIG) --cflags libarchive 2>/dev/null)
+ARCHIVE_LIBS   := $(shell $(PKG_CONFIG) --libs libarchive 2>/dev/null || echo -larchive)
+CRYPTO_CFLAGS  := $(shell $(PKG_CONFIG) --cflags libcrypto 2>/dev/null)
+CRYPTO_LIBS    := $(shell $(PKG_CONFIG) --libs libcrypto 2>/dev/null || echo -lcrypto)
+
+LPM_CPPFLAGS = -Iinclude -D_POSIX_C_SOURCE=200809L $(ARCHIVE_CFLAGS) $(CRYPTO_CFLAGS)
 LPM_CFLAGS   = -std=c11 -Wall -Wextra -Wpedantic -Wshadow -Wformat=2 \
                -Wstrict-prototypes -Wmissing-prototypes
 CFLAGS       = -O2
 LDFLAGS      =
 LDLIBS       =
+LPM_LIBS     = $(ARCHIVE_LIBS) $(CRYPTO_LIBS)
 
 # `make debug` writes its CFLAGS/LDFLAGS here; every later make
 # invocation picks them up until `make clean` deletes the build dir.
@@ -37,11 +47,14 @@ OBJ  = $(SRC:src/%.c=build/%.o)
 # programs link only what they exercise.
 CORE_OBJ = build/util.o build/metadata.o build/version.o build/filelist.o
 DB_OBJ   = $(CORE_OBJ) build/database.o
+PKG_OBJ  = $(DB_OBJ) build/integrity.o build/safefs.o build/archive.o \
+           build/manifest.o build/pkg.o build/install.o
 
 # Unit tests live in tests/ (never matched by the src/*.c wildcard, so
 # they cannot end up in the lpm binary).
 TEST_BIN      = build/test_metadata build/test_version build/test_filelist \
-                build/test_database
+                build/test_database build/test_integrity build/test_archive \
+                build/test_install
 DEMO_BIN      = build/lpm-db-demo
 # GNU ld --wrap lets a test intercept a function to inject failures:
 # allocation failures everywhere, and system-call failures (short
@@ -50,6 +63,7 @@ ALLOC_WRAP    = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc
 SYSCALL_WRAP  = -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=renameat \
                 -Wl,--wrap=openat -Wl,--wrap=unlinkat -Wl,--wrap=mkdirat \
                 -Wl,--wrap=fchmod -Wl,--wrap=close -Wl,--wrap=flock
+INSTALL_WRAP  = $(SYSCALL_WRAP) -Wl,--wrap=linkat -Wl,--wrap=symlinkat
 
 DEP  = $(OBJ:.o=.d) $(TEST_BIN:=.d) build/lpm-db-demo.d
 
@@ -58,7 +72,7 @@ DEP  = $(OBJ:.o=.d) $(TEST_BIN:=.d) build/lpm-db-demo.d
 all: $(BIN)
 
 $(BIN): $(OBJ)
-	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LDLIBS)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LPM_LIBS) $(LDLIBS)
 
 build/%.o: src/%.c | build
 	$(CC) $(LPM_CPPFLAGS) $(CPPFLAGS) $(LPM_CFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
@@ -81,6 +95,16 @@ build/test_filelist: build/test_filelist.o build/filelist.o build/metadata.o bui
 build/test_database: build/test_database.o $(DB_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(SYSCALL_WRAP) -o $@ $^ $(LDLIBS)
 
+build/test_integrity: build/test_integrity.o build/integrity.o build/metadata.o build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(CRYPTO_LIBS) $(LDLIBS)
+
+build/test_archive: build/test_archive.o build/archive.o build/safefs.o build/filelist.o \
+                    build/metadata.o build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(ARCHIVE_LIBS) $(LDLIBS)
+
+build/test_install: build/test_install.o $(PKG_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(INSTALL_WRAP) -o $@ $^ $(LPM_LIBS) $(LDLIBS)
+
 $(DEMO_BIN): build/lpm-db-demo.o $(DB_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -101,12 +125,18 @@ test: $(BIN) $(TEST_BIN) $(DEMO_BIN)
 	./build/test_version
 	./build/test_filelist
 	./build/test_database
+	./build/test_integrity
+	./build/test_archive
+	./build/test_install
 
 unit-test: $(TEST_BIN)
 	./build/test_metadata tests/fixtures
 	./build/test_version
 	./build/test_filelist
 	./build/test_database
+	./build/test_integrity
+	./build/test_archive
+	./build/test_install
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)

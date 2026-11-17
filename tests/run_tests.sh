@@ -1,5 +1,5 @@
 #!/bin/bash
-# CLI tests (Milestones 1-3). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo]
+# CLI tests (Milestones 1-4). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo]
 #
 # Every test runs against a throwaway --root directory, never against /.
 
@@ -71,8 +71,10 @@ run --root "$FULL" list;  check "list: missing version shown ?"  0 out "nover  *
 run --root "$FULL" list;  check "list: warns on invalid name"    0 err "invalid package name: Bad..Name.meta"
 run --root="$FULL" list;  check "--root=DIR form"                0 out "hello"
 run list extra;           check "list rejects extra arguments"   2 err "too many arguments"
-run --root "$EMPTY" install foo.pkg
-                          check "install not implemented yet"    1 err "not implemented"
+# Milestone 4 implemented `install`, so (with the project owner's approval)
+# this check now uses `remove`, still unimplemented: same exit code and message.
+run --root "$EMPTY" remove foo
+                          check "remove not implemented yet"     1 err "not implemented"
 run install;              check "install requires argument"      2 err "requires an argument"
 
 # --- Milestone 2: metadata parser through the CLI ---------------------
@@ -220,6 +222,128 @@ chmod g+w "$GW/var/lib/lpm/installed"
 rund --root "$GW" register "$IN/libfoo.meta"
                                  check "demo: group-writable db refused"    1 err "writable by group or others"
 fi
+
+
+# --- Milestone 4: package verification and installation --------------
+# Packages are built with tools/lpm-mkpkg.sh (bash + coreutils + GNU tar)
+# and installed only into throw-away roots; the real / is never used.
+MKPKG="$(dirname "$0")/../tools/lpm-mkpkg.sh"
+echo "Running Milestone 4 CLI tests"
+P4="$WORK/m4"
+mkdir -p "$P4"
+sha_of() { sha256sum "$1" | cut -d' ' -f1; }
+
+# A package source tree: binary, symlink, config, doc, empty directory.
+SRC="$P4/hello-src"
+mkdir -p "$SRC/payload/usr/bin" "$SRC/payload/etc" \
+         "$SRC/payload/usr/share/doc/hello" "$SRC/payload/usr/share/hello/empty"
+printf '#!/bin/sh\necho "Hello from LPM"\n' > "$SRC/payload/usr/bin/hello"
+chmod 755 "$SRC/payload/usr/bin/hello"
+ln -s hello "$SRC/payload/usr/bin/hi"
+printf 'greeting=hello\n' > "$SRC/payload/etc/hello.conf"
+printf 'Hello demo package\n' > "$SRC/payload/usr/share/doc/hello/README"
+printf "lpm-cli-isolation-$$\n" > "$SRC/payload/usr/bin/lpm-cli-isolation-$$"
+printf 'name=hello\nversion=1.2.0\ndescription=Hello demo package\n' > "$SRC/metadata.in"
+
+if bash "$MKPKG" "$SRC" "$P4/hello.lpm" xz >"$WORK/out" 2>"$WORK/err"; then CODE=0; else CODE=$?; fi
+check "mkpkg: builds an xz package" 0 out "Built"
+bash "$MKPKG" "$SRC" "$P4/hello.tar.gz.lpm" gz >/dev/null 2>&1
+bash "$MKPKG" "$SRC" "$P4/hello.tar.lpm" none >/dev/null 2>&1
+HSHA=$(sha_of "$P4/hello.lpm")
+HSHA_UP=$(echo "$HSHA" | tr a-f A-F)
+ZERO=0000000000000000000000000000000000000000000000000000000000000000
+
+run verify "$P4/hello.lpm";                 check "verify: good package"               0 out "INTEGRITY OK"
+run verify "$P4/hello.lpm";                 check "verify: counts payload"             0 out "4 files, 1 symlink"
+run verify "$P4/hello.lpm";                 check "verify: prints package SHA-256"     0 out "Package SHA-256:  $HSHA"
+run verify "$P4/hello.tar.gz.lpm";          check "verify: gzip package"               0 out "INTEGRITY OK"
+run verify "$P4/hello.tar.lpm";             check "verify: uncompressed package"       0 out "INTEGRITY OK"
+run verify "$P4/hello.lpm" --sha256 "$HSHA";    check "verify: correct --sha256"       0 out "matches --sha256"
+run verify "$P4/hello.lpm" --sha256 "$HSHA_UP"; check "verify: uppercase --sha256"     0 out "matches --sha256"
+run verify "$P4/hello.lpm" --sha256 "$ZERO";    check "verify: wrong --sha256"         1 err "INTEGRITY FAILURE: package file SHA-256 mismatch"
+run verify "$P4/hello.lpm" --sha256 abc;        check "verify: malformed --sha256"     1 err "exactly 64 hexadecimal digits"
+run verify "$P4/hello.lpm" --bogus x;           check "verify: bad option"             2 err "usage"
+run verify "$P4/missing.lpm";               check "verify: missing file"               1 err "No such file"
+
+R4="$P4/root"
+mkdir "$R4"
+run --root "$R4" install "$P4/hello.lpm" --sha256 "$HSHA"
+                                            check "install: succeeds"                  0 out "Installed hello 1.2.0"
+if [ -x "$R4/usr/bin/hello" ] && [ "$("$R4/usr/bin/hello")" = "Hello from LPM" ] &&
+   [ -L "$R4/usr/bin/hi" ] && [ -f "$R4/etc/hello.conf" ] && [ -d "$R4/usr/share/hello/empty" ]
+then ok "install: files extracted into the root"; else bad "install: files extracted into the root"; fi
+if [ ! -e "/usr/bin/lpm-cli-isolation-$$" ] && [ -f "$R4/usr/bin/lpm-cli-isolation-$$" ]
+then ok "install: nothing written to the host /usr"; else bad "install: nothing written to the host /usr"; fi
+run --root "$R4" list;                      check "install: listed"                    0 out "hello  *1.2.0"
+run --root "$R4" info hello;                check "install: manifest digest recorded"  0 out "^Manifest SHA256: [0-9a-f]\{64\}$"
+run --root "$R4" check;                     check "install: database consistent"       0 out "owning 5 files"
+run --root "$R4" install "$P4/hello.lpm";   check "install: second time refused"       1 err "already registered"
+
+# Wrong whole-file digest: refused before the archive is even read.
+R5="$P4/root-wrongsha"; mkdir "$R5"
+run --root "$R5" install "$P4/hello.lpm" --sha256 "$ZERO"
+                                            check "install: wrong --sha256 rejected"   1 err "INTEGRITY FAILURE"
+if [ -z "$(ls -A "$R5")" ]; then ok "install: wrong --sha256 wrote nothing"; else bad "install: wrong --sha256 wrote nothing"; fi
+
+# Tampered payload: same metadata and manifest, one file changed.
+T="$P4/tamper"; mkdir "$T"
+tar -xJf "$P4/hello.lpm" -C "$T"
+printf '#!/bin/sh\necho owned\n' > "$T/payload/usr/bin/hello"
+tar -cJf "$P4/tampered.lpm" -C "$T" metadata.txt manifest.txt payload
+R6="$P4/root-tampered"; mkdir "$R6"
+run verify "$P4/tampered.lpm";              check "verify: tampered package fails"     1 err "SHA-256 mismatch for /usr/bin/hello"
+run --root "$R6" install "$P4/tampered.lpm"; check "install: tampered package rejected" 1 err "INTEGRITY FAILURE"
+if [ ! -e "$R6/usr" ] && [ ! -e "$R6/etc" ]; then ok "install: tampered package installed nothing"
+else bad "install: tampered package installed nothing"; fi
+run --root "$R6" list;                      check "install: tampered not registered"   0 out "No packages installed."
+
+# Malicious archives: valid metadata and hashes, hostile entry names.
+EV="$P4/evil"; mkdir -p "$EV/payload/etc"
+printf 'pwned\n' > "$EV/payload/etc/escape.txt"
+printf 'file %s 0644 /etc/escape.txt\n' "$(sha_of "$EV/payload/etc/escape.txt")" > "$EV/manifest.txt"
+printf 'name=evil\nversion=1\nmanifest_sha256=%s\n' "$(sha_of "$EV/manifest.txt")" > "$EV/metadata.txt"
+tar -cf "$P4/traversal.lpm" -C "$EV" metadata.txt manifest.txt \
+    --transform='s,^payload/etc/escape.txt$,payload/../../escape.txt,' payload/etc/escape.txt 2>/dev/null
+tar -P -cf "$P4/absolute.lpm" -C "$EV" metadata.txt manifest.txt \
+    --transform="s,^payload/etc/escape.txt\$,$P4/abs-escape.txt," payload/etc/escape.txt 2>/dev/null
+R7="$P4/jail/root"; mkdir -p "$R7"
+run --root "$R7" install "$P4/traversal.lpm"; check "install: path traversal rejected"  1 err "path traversal"
+run --root "$R7" install "$P4/absolute.lpm";  check "install: absolute path rejected"   1 err "absolute path"
+if [ ! -e "$P4/jail/escape.txt" ] && [ ! -e "$P4/escape.txt" ] && [ ! -e "$P4/abs-escape.txt" ] &&
+   [ "$(ls -A "$P4/jail")" = "root" ]
+then ok "install: nothing escaped the root"; else bad "install: nothing escaped the root"; fi
+
+# Symlink escapes.
+SL="$P4/symlink-src"; mkdir -p "$SL/payload/usr/lib"
+ln -s /etc "$SL/payload/usr/lib/evil"
+printf 'name=evil\nversion=1\n' > "$SL/metadata.in"
+bash "$MKPKG" "$SL" "$P4/symlink.lpm" none >/dev/null 2>&1
+R8="$P4/root-symlink"; mkdir "$R8"
+run --root "$R8" install "$P4/symlink.lpm"; check "install: absolute symlink rejected"  1 err "symlink target must be relative"
+R9="$P4/root-planted"; mkdir -p "$R9" "$P4/elsewhere"
+ln -s "$P4/elsewhere" "$R9/usr"             # planted before installing
+run --root "$R9" install "$P4/hello.lpm";   check "install: planted symlink refused"    1 err "symbolic link or not a directory"
+if [ -z "$(ls -A "$P4/elsewhere")" ]; then ok "install: nothing written through planted symlink"
+else bad "install: nothing written through planted symlink"; fi
+
+# Existing unowned file is never overwritten.
+R10="$P4/root-existing"; mkdir -p "$R10/etc"
+printf 'hand-made\n' > "$R10/etc/hello.conf"
+run --root "$R10" install "$P4/hello.lpm";  check "install: existing file conflict"     1 err "already exists in the target root"
+if [ "$(cat "$R10/etc/hello.conf")" = "hand-made" ] && [ ! -e "$R10/usr" ]
+then ok "install: existing file kept, nothing placed"; else bad "install: existing file kept, nothing placed"; fi
+
+# The real root is refused before anything is read. The package is the
+# tampered one, so even a broken guard could not install anything.
+run install "$P4/tampered.lpm";             check "install: real root refused"          1 err "real root filesystem is disabled"
+
+# An interrupted installation is reported by check.
+mkdir -p "$R4/var/lib/lpm/staging/install.999.0"
+run --root "$R4" check;                     check "check: interrupted install reported" 1 out "interrupted installation"
+rmdir "$R4/var/lib/lpm/staging/install.999.0"
+
+run help;                                   check "help: install implemented"           0 out "install <file.lpm> \[--sha256 HEX\]  *Install a local package (not into / yet)$"
+run help;                                   check "help: remove still planned"          0 out "remove <package>.*(planned)$"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

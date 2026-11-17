@@ -109,7 +109,13 @@ typedef enum {
     LPM_META_ERR_PATH_CONFLICT,    /* path is both a file and a parent   */
     LPM_META_ERR_TOO_MANY_FILES,   /* > LPM_FILES_MAX_ENTRIES            */
     LPM_META_ERR_UNTRUSTED,        /* unsafe owner/permissions/symlink   */
-    LPM_META_ERR_STATE             /* operation not valid in this state  */
+    LPM_META_ERR_STATE,            /* operation not valid in this state  */
+    /* Added in Milestone 4 (archives and integrity). */
+    LPM_META_ERR_HASH_MISMATCH,    /* SHA-256 differs from the expected  */
+    LPM_META_ERR_CRYPTO,           /* OpenSSL failed                     */
+    LPM_META_ERR_ARCHIVE,          /* unreadable / corrupt / unsupported */
+    LPM_META_ERR_UNSAFE_ENTRY      /* traversal, absolute path, symlink, */
+                                   /* hard link or special file          */
 } lpm_meta_error_code;
 
 /*
