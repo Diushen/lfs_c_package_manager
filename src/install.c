@@ -7,6 +7,7 @@
 #include "integrity.h"
 #include "manifest.h"
 #include "pkg.h"
+#include "plan.h"
 #include "safefs.h"
 #include "util.h"
 
@@ -255,27 +256,187 @@ static lpm_status commit(int root_fd, int stage_fd, const lpm_manifest *m,
     return LPM_OK;
 }
 
-lpm_status lpm_install_package(const lpm_config *cfg, const char *path,
-                               const lpm_install_options *opt,
-                               lpm_pkg_summary *out, lpm_meta_error *err)
+/* ==================================================================== */
+/* Milestone 5: plan-driven, all-or-nothing installation                 */
+/* ==================================================================== */
+
+/* One package of a plan, from verification to commit. */
+typedef struct {
+    const lpm_plan_node *node;     /* what the plan selected               */
+    int fd;
+    char digest[LPM_SHA256_HEX_LEN + 1];
+    int stage_fd;
+    char stage_name[LPM_DB_STAGE_NAME_MAX];
+    lpm_pkg pkg;                   /* fully verified contents              */
+    lpm_file_list files;           /* what it will own                     */
+    lpm_path_log log;              /* what committing it created           */
+    bool registered;
+} prepared;
+
+static void prepared_init(prepared *p, const lpm_plan_node *node)
+{
+    memset(p, 0, sizeof(*p));
+    p->node = node;
+    p->fd = -1;
+    p->stage_fd = -1;
+    lpm_pkg_init(&p->pkg);
+    lpm_file_list_init(&p->files);
+    lpm_path_log_init(&p->log);
+}
+
+static void prepared_free(lpm_db *db, prepared *p)
+{
+    if (p->stage_fd >= 0) {
+        lpm_meta_error ignore;
+        /* Staged names go; installed files keep their own links. A
+         * failure leaves a directory that lpm check reports. */
+        (void)lpm_db_remove_staging(db, p->stage_fd, p->stage_name, &ignore);
+        p->stage_fd = -1;
+    }
+    if (p->fd >= 0)
+        close(p->fd);
+    p->fd = -1;
+    lpm_path_log_free(&p->log);
+    lpm_file_list_free(&p->files);
+    lpm_pkg_free(&p->pkg);
+}
+
+/* Name the package an error belongs to. */
+static void blame(lpm_meta_error *err, const lpm_plan_node *n)
+{
+    if (err != NULL) {
+        lpm_meta_error orig = *err;
+        lpm_meta_error_set(err, orig.code, orig.line, orig.field, "%s %s: %.200s",
+                           n->pkg->name, n->pkg->version, orig.message);
+    }
+}
+
+/*
+ * Full Milestone 4 verification of one planned package: whole-file hash
+ * (root package only, if --sha256 was given), metadata, manifest hash,
+ * every payload hash, staging, database rules and filesystem pre-flight.
+ * The verified metadata must be exactly what the plan was built from.
+ */
+static lpm_status prepare(lpm_db *db, prepared *p, const char *expected,
+                          lpm_meta_error *err)
+{
+    lpm_status rc;
+
+    rc = open_package(p->node->source, expected, &p->fd, p->digest, err);
+    if (rc == LPM_OK)
+        rc = lpm_db_open_staging(db, &p->stage_fd, p->stage_name, err);
+    if (rc == LPM_OK)
+        rc = lpm_pkg_read(p->fd, p->stage_fd, &p->pkg, err);
+    if (rc == LPM_OK && !lpm_package_equal(&p->pkg.meta, p->node->pkg)) {
+        lpm_meta_error_set(err, LPM_META_ERR_STATE, 0, NULL,
+                           "package file changed after the dependency plan was made");
+        rc = LPM_ERR_INVALID;
+    }
+    if (rc == LPM_OK)
+        rc = lpm_manifest_owned(&p->pkg.manifest, &p->files, err);
+    if (rc == LPM_OK)
+        rc = lpm_db_check_register(db, &p->pkg.meta, &p->files, err);
+    if (rc == LPM_OK)
+        rc = preflight(db->root_fd, &p->pkg.manifest, err);
+    return rc;
+}
+
+typedef struct {
+    const prepared *pkgs;
+    lpm_meta_error *err;
+    bool hit;
+} batch_conflict;
+
+/* owner = package index * 4 + manifest entry type */
+static bool on_batch_conflict(void *ctx, const lpm_owned_path *a,
+                              const lpm_owned_path *b, bool same_path)
+{
+    batch_conflict *c = ctx;
+    size_t pa = a->owner / 4, pb = b->owner / 4;
+    bool a_dir = a->owner % 4 == LPM_MAN_DIR, b_dir = b->owner % 4 == LPM_MAN_DIR;
+
+    if (same_path ? (a_dir && b_dir) : a_dir)
+        return true;   /* a shared directory, or a directory with contents */
+    if (pa == pb)
+        return true;   /* impossible: each manifest was validated */
+    c->hit = true;
+    lpm_meta_error_set(c->err, LPM_META_ERR_PATH_CONFLICT, 0, "path",
+                       "%s and %s both need %.200s", c->pkgs[pa].pkg.meta.name,
+                       c->pkgs[pb].pkg.meta.name, same_path ? a->path : b->path);
+    return false;
+}
+
+/* Packages of one plan must not collide with each other either (the
+ * database only knows about packages that are already registered). */
+static lpm_status check_batch(const prepared *p, size_t n, lpm_meta_error *err)
+{
+    lpm_owned_path *v;
+    size_t total = 0, i, j, k = 0;
+    batch_conflict ctx;
+
+    if (n < 2)
+        return LPM_OK;
+    for (i = 0; i < n; i++)
+        total += p[i].pkg.manifest.count;   /* <= 1024 * 131072: fits */
+    v = malloc((total ? total : 1) * sizeof(*v));
+    if (v == NULL) {
+        lpm_meta_error_set(err, LPM_META_ERR_NOMEM, 0, NULL, "out of memory");
+        return LPM_ERR_NOMEM;
+    }
+    for (i = 0; i < n; i++)
+        for (j = 0; j < p[i].pkg.manifest.count; j++) {
+            v[k].path = p[i].pkg.manifest.entries[j].path;
+            v[k++].owner = i * 4 + (size_t)p[i].pkg.manifest.entries[j].type;
+        }
+    lpm_owned_paths_sort(v, total);
+    ctx.pkgs = p;
+    ctx.err = err;
+    ctx.hit = false;
+    lpm_owned_paths_conflicts(v, total, on_batch_conflict, &ctx);
+    free(v);
+    return ctx.hit ? LPM_ERR_CONFLICT : LPM_OK;
+}
+
+/* Undo a committed (possibly registered) package of this run only: its
+ * record, then exactly the files and directories this run created. */
+static void undo_package(lpm_db *db, prepared *p)
+{
+    if (p->registered) {
+        lpm_meta_error ignore;
+        (void)lpm_db_unregister_package(db, p->pkg.meta.name, &ignore);
+        p->registered = false;
+    }
+    lpm_safe_rollback(db->root_fd, &p->log);
+}
+
+void lpm_install_report_free(lpm_install_report *r)
+{
+    if (r == NULL)
+        return;
+    free(r->items);
+    r->items = NULL;
+    r->count = 0;
+    r->satisfied = 0;
+}
+
+lpm_status lpm_install_packages(const lpm_config *cfg, const char *path,
+                                const char *package_dir,
+                                const lpm_install_options *opt,
+                                lpm_install_report *report, lpm_meta_error *err)
 {
     static const lpm_install_options defaults = { NULL, false, 0 };
-    char digest[LPM_SHA256_HEX_LEN + 1], stage_name[LPM_DB_STAGE_NAME_MAX];
-    lpm_file_list files;
-    lpm_path_log log;
-    lpm_pkg pkg;
-    lpm_db db;
+    char digest[LPM_SHA256_HEX_LEN + 1];
+    lpm_resolution res;
+    prepared *pkgs = NULL;
+    size_t n = 0, done = 0, i;
     lpm_status rc;
-    int fd = -1, stage_fd = -1;
-    bool db_open = false;
+    lpm_db db;
+    int fd;
 
-    summary_clear(out);
+    memset(report, 0, sizeof(*report));
+    memset(&res, 0, sizeof(res));
     if (opt == NULL)
         opt = &defaults;
-    lpm_pkg_init(&pkg);
-    lpm_file_list_init(&files);
-    lpm_path_log_init(&log);
-    stage_name[0] = '\0';
 
     /* 1. Only checksums are verified so far, not who made the package,
      *    so the live system is off limits. */
@@ -286,69 +447,103 @@ lpm_status lpm_install_package(const lpm_config *cfg, const char *path,
                            "use --root DIR");
         return LPM_ERR_INVALID;
     }
-
-    /* 2. Package file and optional whole-file digest. */
+    /* 2. The requested file must exist and match --sha256 before anything
+     *    is created (not even an empty database). */
     rc = open_package(path, opt->expected_sha256, &fd, digest, err);
     if (rc != LPM_OK)
         return rc;
+    close(fd);
 
-    /* 3. Lock for the whole operation. */
+    /* 3. One exclusive lock for planning, verification and commit. */
     rc = lpm_db_open(cfg, LPM_DB_CREATE, opt->lock_wait_ms, &db, err);
     if (rc != LPM_OK)
-        goto out;
-    db_open = true;
-    rc = lpm_db_open_staging(&db, &stage_fd, stage_name, err);
+        return rc;
+
+    /* 4. Plan against the installed set seen under this lock. */
+    rc = lpm_resolve_request(cfg, path, package_dir, true, &res, err);
     if (rc != LPM_OK)
         goto out;
-
-    /* 4. Verify everything; verified files land in staging only. */
-    rc = lpm_pkg_read(fd, stage_fd, &pkg, err);
-    if (rc != LPM_OK)
+    n = res.plan.order_count;
+    pkgs = calloc(n ? n : 1, sizeof(*pkgs));
+    report->items = calloc(n ? n : 1, sizeof(*report->items));
+    if (pkgs == NULL || report->items == NULL) {
+        lpm_meta_error_set(err, LPM_META_ERR_NOMEM, 0, NULL, "out of memory");
+        rc = LPM_ERR_NOMEM;
         goto out;
+    }
+    for (i = 0; i < n; i++)
+        prepared_init(&pkgs[i], &res.plan.nodes[res.plan.order[i]]);
 
-    /* 5. Pre-flight. */
-    rc = lpm_manifest_owned(&pkg.manifest, &files, err);
-    if (rc == LPM_OK)
-        rc = lpm_db_check_register(&db, &pkg.meta, &files, err);
-    if (rc == LPM_OK)
-        rc = preflight(db.root_fd, &pkg.manifest, err);
-    if (rc != LPM_OK)
-        goto out;
-
-    /* 6. Commit files, then 7. the record. */
-    rc = commit(db.root_fd, stage_fd, &pkg.manifest, &log, err);
-    if (rc == LPM_OK) {
-        rc = lpm_db_register_package(&db, &pkg.meta, &files, err);
+    /* 5. Verify and stage EVERY package before placing any file. */
+    for (i = 0; i < n; i++) {
+        const char *expect = res.plan.order[i] == 0 ? opt->expected_sha256 : NULL;
+        rc = prepare(&db, &pkgs[i], expect, err);
         if (rc != LPM_OK) {
-            bool exists = false;
-            lpm_meta_error ignore;
-            /* "not flushed": recorded but maybe not durable -> keep files. */
-            if (lpm_db_package_exists(&db, pkg.meta.name, &exists, &ignore) == LPM_OK &&
-                exists)
-                lpm_path_log_free(&log);
+            blame(err, pkgs[i].node);
+            goto out;
+        }
+    }
+    rc = check_batch(pkgs, n, err);
+    if (rc != LPM_OK)
+        goto out;
+
+    /* 6. Commit in dependency order: files, then the record. */
+    for (done = 0; done < n; done++) {
+        prepared *p = &pkgs[done];
+        rc = commit(db.root_fd, p->stage_fd, &p->pkg.manifest, &p->log, err);
+        if (rc == LPM_OK) {
+            rc = lpm_db_register_package(&db, &p->pkg.meta, &p->files, err);
+            if (rc != LPM_OK) {
+                bool exists = false;
+                lpm_meta_error ignore;
+                /* "not flushed": the record exists but may not be durable;
+                 * treat as a failure of the whole run and undo it too. */
+                if (lpm_db_package_exists(&db, p->pkg.meta.name, &exists, &ignore) ==
+                        LPM_OK && exists)
+                    p->registered = true;
+            } else {
+                p->registered = true;
+            }
+        }
+        if (rc != LPM_OK) {
+            blame(err, p->node);
+            break;
         }
     }
     if (rc != LPM_OK) {
-        lpm_safe_rollback(db.root_fd, &log);
+        /* 7. All or nothing: undo this run, newest first. */
+        size_t k = done < n ? done + 1 : n;
+        while (k-- > 0)
+            undo_package(&db, &pkgs[k]);
         goto out;
     }
-    summary_fill(out, &pkg, digest);
+    for (i = 0; i < n; i++)
+        summary_fill(&report->items[i], &pkgs[i].pkg, pkgs[i].digest);
+    report->count = n;
+    report->satisfied = res.plan.satisfied;
 
 out:
-    lpm_path_log_free(&log);
-    if (stage_fd >= 0) {
-        lpm_meta_error cleanup_err;
-        /* 8. Staged names go; installed files keep their own links. If
-         *    this fails the package is still correctly installed and
-         *    registered, so the result stands; the leftover directory is
-         *    reported by lpm check. */
-        (void)lpm_db_remove_staging(&db, stage_fd, stage_name, &cleanup_err);
-    }
-    if (db_open)
-        lpm_db_close(&db);
-    lpm_file_list_free(&files);
-    lpm_pkg_free(&pkg);
-    if (fd >= 0)
-        close(fd);
+    if (pkgs != NULL)
+        for (i = 0; i < n; i++)
+            prepared_free(&db, &pkgs[i]);
+    free(pkgs);
+    if (rc != LPM_OK)
+        lpm_install_report_free(report);
+    lpm_resolution_free(&res);
+    lpm_db_close(&db);
+    return rc;
+}
+
+lpm_status lpm_install_package(const lpm_config *cfg, const char *path,
+                               const lpm_install_options *opt,
+                               lpm_pkg_summary *out, lpm_meta_error *err)
+{
+    lpm_install_report r;
+    lpm_status rc = lpm_install_packages(cfg, path, NULL, opt, &r, err);
+
+    summary_clear(out);
+    if (rc == LPM_OK && out != NULL && r.count > 0)
+        *out = r.items[r.count - 1];   /* the requested package comes last */
+    lpm_install_report_free(&r);
     return rc;
 }

@@ -43,7 +43,8 @@ typedef enum {
     LPM_ERR_BUSY,             /* database locked by another process    */
     LPM_ERR_CONFLICT,         /* file already owned by another package */
     LPM_ERR_INTEGRITY,        /* SHA-256 mismatch: content was altered  */
-    LPM_ERR_CRYPTO            /* the hashing library itself failed      */
+    LPM_ERR_CRYPTO,           /* the hashing library itself failed      */
+    LPM_ERR_DEPENDENCY        /* dependencies cannot be satisfied       */
 } lpm_status;
 
 /* Runtime configuration built from global command-line options. */

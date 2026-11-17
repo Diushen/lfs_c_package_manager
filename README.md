@@ -15,7 +15,8 @@ system.
 | 2         | Metadata parser, package structures, `info`       | done  |
 | 3         | Version comparison, locked atomic database writes, file ownership, `check` | done |
 | 4         | Package archives (libarchive), SHA-256 integrity (OpenSSL), `verify`, `install` | done |
-| 5–12      | dependency graph, Ed25519 signatures, remove, ... | planned |
+| 5         | Dependency graph: version constraints, cycle detection, topological order, `plan`, multi-package `install` | done |
+| 6–12      | Ed25519 signatures, remove, ... | planned |
 
 `lpm install` checks **integrity** (SHA-256), not **authenticity**: until
 Ed25519 signatures arrive it refuses to install into the real `/` and only
@@ -57,7 +58,8 @@ allocation failures and, for the database, system-call failures.
     lpm --root ./demo-root info hello
     lpm --root ./demo-root check
     lpm verify hello.lpm [--sha256 HEX]
-    lpm --root ./demo-root install hello.lpm [--sha256 HEX]
+    lpm --root ./demo-root install hello.lpm [--sha256 HEX] [--package-dir DIR]
+    lpm --root ./demo-root plan app.lpm [--package-dir DIR]
 
 ## Layout
 
@@ -73,14 +75,16 @@ allocation failures and, for the database, system-call failures.
       safefs.h          symlink-refusing, root-relative file creation   (M4)
       manifest.h        manifest.txt parser                             (M4)
       pkg.h             reading + verifying a .lpm package              (M4)
-      install.h         verify / install pipeline                       (M4)
+      install.h         verify / install pipeline (multi-package in M5)  (M4, M5)
+      solver.h          dependency graph, cycles, topological order     (M5)
+      plan.h            gathers candidates + installed set for solver   (M5)
       commands.h        command table
     src/                implementation of each header + main.c
     tools/
       lpm-db-demo.c     demonstration driver for the database API       (M3)
       lpm-mkpkg.sh      builds .lpm packages (bash, coreutils, GNU tar)  (M4)
     tests/
-      run_tests.sh      CLI tests (Milestones 1-4)
+      run_tests.sh      CLI tests (Milestones 1-5)
       test_framework.h  tiny shared test framework                      (M3)
       test_metadata.c   metadata parser unit tests                      (M2)
       test_version.c    version comparison unit tests                   (M3)
@@ -89,12 +93,16 @@ allocation failures and, for the database, system-call failures.
       test_integrity.c  SHA-256 known-answer and error tests            (M4)
       test_archive.c    safe extraction and attack tests                (M4)
       test_install.c    end-to-end install, tampering, faults, crashes  (M4)
+      test_solver.c     solver algorithms on in-memory packages         (M5)
+      test_deps.c       planning + multi-package install, end to end    (M5)
       fixtures/         example valid/invalid metadata files            (M2)
     examples/           demonstration packages (later milestones)
 
 Module dependencies point one way only:
 
-    main.c ─► commands.c ─► install.c ─► pkg.c ─┬─► manifest.c
+    main.c ─► commands.c ─► install.c ─► plan.c ─► solver.c ─► version.c
+                     │                 │
+                     │                 ├─► pkg.c ─┬─► manifest.c
                      │                 │        ├─► archive.c ──► libarchive
                      │                 │        └─► integrity.c ─► OpenSSL
                      │                 └─► safefs.c
@@ -980,4 +988,225 @@ tar -cf /tmp/evil.lpm -C $E metadata.txt manifest.txt \
     --transform='s,^payload/etc/x$,payload/../../escape.txt,' payload/etc/x
 ./lpm --root $R install /tmp/evil.lpm             #    path traversal rejected
 ls $R/../escape.txt $R/../../escape.txt           #    neither exists
+```
+
+---
+
+## Dependency resolution (Milestone 5)
+
+### Dependencies in metadata
+
+Dependencies use the Milestone 2 `depends=` lines, one per dependency:
+
+| Line | Meaning |
+|------|---------|
+| `depends=libfoo>=1.2` | at least 1.2 |
+| `depends=libbar=2.0` | exactly 2.0 (numerically, so `2.0.0` matches too) |
+| `depends=libold<3.0` | below 3.0, strictly (**new in Milestone 5**) |
+
+* Only these three operators exist; `<=`, `>`, `!=`, `~` and the rest are
+  rejected.
+* Versions are compared with the Milestone 3 rules
+  (`lpm_version_satisfies()`).
+* Package names are lowercase (`liba`, not `libA`).
+
+### How a plan is made (`lpm plan`, `lpm install`)
+
+The planner never writes anything. It gathers:
+
+* **Installed packages** from the database under `--root`, read under a
+  shared lock. They are fixed: LPM doesn't upgrade, so an installed version
+  must satisfy every requirement on it.
+* **The requested `.lpm` file.**
+* **Candidates:** every `*.lpm` in `--package-dir DIR`, in sorted order.
+  * Hidden files and other names are ignored.
+  * The requested file may sit in the same directory.
+  * Two candidates with the same name and version (`1.0` and `1.0.0`
+    count as the same) are refused as ambiguous.
+  * For planning, only each candidate's `metadata.txt` is read. That isn't
+    verification.
+
+**Version selection** is a bounded backtracking search (`src/solver.c`):
+
+1. Names are handled in discovery order: the requested package, then its
+   dependencies in declaration order, then theirs.
+2. For each name, versions are tried from highest to lowest. A version is
+   accepted only if:
+   - it satisfies every requirement already placed on that name; and
+   - its own requirements hold for every name already chosen.
+3. If a name has no acceptable version, the search goes back to the
+   previous name and tries its next version.
+
+So the result is **globally consistent**: every requirement in the plan
+holds for the single version chosen for each name. The policy is to take the
+highest compatible version, deciding earlier-discovered names first.
+
+Each version tried counts as one step, and the search stops at 100,000
+steps. The worst case is exponential, which is why the limit exists: no
+package can make LPM search forever.
+
+**The graph** has one node per selected package, stored as adjacency lists.
+Edge `j` of a node is that package's `j`-th `depends=` line, so each edge
+keeps its constraint. Installed packages are leaves.
+
+**Cycle detection and order** use one iterative depth-first search from the
+requested package, with three colours: white (unvisited), grey (on the
+current path) and black (done).
+* Reaching a grey node is a cycle. LPM reports it as
+  `a -> b -> c -> a`, or `a -> a` for a direct self-dependency.
+* A package is added to the order when it turns black, after all of its
+  dependencies. This post-order is the installation order.
+* The traversal is iterative, so even a 1,024-deep chain can't overflow the
+  C stack.
+
+**Complexity**, with V packages in the plan and E dependency edges:
+
+| Part | Time | Space |
+|------|------|-------|
+| Cycle detection and topological sort | O(V + E) | O(V) |
+| Depth computation (direct or transitive), breadth-first | O(V + E) | O(V) |
+| Name table | O(N log N) for N names | O(N) |
+| Version selection | O(steps × requirements per name) | O(V + E) |
+
+Version selection, the candidate search, is bounded by the step limit.
+
+**Determinism:** discovery order, version order and edge order are all
+fixed, so the same inputs always produce the same plan.
+
+**Limits:**
+* 4,096 candidates plus installed packages.
+* 1,024 packages per plan.
+* 100,000 search steps.
+* 128 dependencies per package (the Milestone 2 limit).
+
+Exceeding any of these is a clear error, never a partial plan.
+
+### Example
+
+```
+app -> liba -> libc
+app -> libb -> libc
+```
+
+```
+$ lpm --root R plan pkgs/app-1.0.lpm --package-dir pkgs
+Dependency graph (package -> requirement => selected):
+  app 1.0
+      -> liba >= 1.0  =>  liba 1.2
+      -> libb >= 1.0  =>  libb 1.0
+  liba 1.2
+      -> libc >= 1.0  =>  libc 1.0
+  ...
+Installation order (dependencies first):
+  1. libc 1.0  [transitive dependency]
+  2. liba 1.2  [direct dependency]
+  3. libb 1.0  [direct dependency]
+  4. app 1.0  [requested]
+```
+
+`libc` appears once, before both of its users.
+* **Direct dependency:** depth 1, named in the requested package's own
+  metadata.
+* **Transitive dependency:** depth 2 or more, needed only through another
+  package.
+
+### Errors
+
+The status is `LPM_ERR_DEPENDENCY` unless noted; the error code is in
+`lpm_meta_error.code`.
+
+| Code | Example message |
+|------|-----------------|
+| `DEP_MISSING` | `missing dependency: libbar >= 2.0 (required by app 1.0); it is neither installed nor available` |
+| `DEP_INSTALLED` | `version conflict: required libfoo >= 2.0 (required by app 1.0); installed libfoo 1.5 (installed packages are not upgraded)` |
+| `DEP_CONFLICT` | `conflicting requirements: library < 2.0 (required by b 1.0); library >= 3.0 (required by a 1.0); available versions of library: 3.1, 1.0` |
+| `DEP_CYCLE` | `dependency cycle detected: a -> b -> c -> a` |
+| `DEP_DUPLICATE` | `two candidates for libc 1.0: pkgs/libc-1.0.lpm and pkgs/libc-copy.lpm` |
+| `DEP_LIMIT` | `dependency search gave up after 100000 candidate attempts` |
+| `DEP_ALREADY` (`LPM_ERR_EXISTS`) | `package 'app' is already registered (installed version 1.0)` |
+
+An unreadable or invalid candidate stops planning, with the file named in
+the message. When the search fails, the error reported is the first one met
+in its deterministic search order.
+
+### Installation with dependencies
+
+* **`lpm install app.lpm`** now checks dependencies: a missing or
+  unsatisfied one is refused before anything is written.
+* **`lpm install app.lpm --package-dir DIR`** also installs the missing
+  dependencies, as one all-or-nothing operation:
+
+1. Refuse `/`. Check that the requested file exists and matches `--sha256`
+   (if given) before anything is created.
+2. Lock the database and plan against the installed set seen under that
+   lock.
+3. Verify and stage every package of the plan, using all the Milestone 4
+   checks: metadata, manifest hash, every payload hash, safe paths, staging,
+   ownership and filesystem pre-flight.
+   - The verified metadata must equal what the plan was built from, so a
+     file swapped in between is refused.
+   - A dependency is never trusted just because it appears in the plan.
+4. Check the new packages against each other: no two may install the same
+   file.
+5. Commit in dependency order: each package's files, then its record.
+6. If any package fails in step 5, the whole run is undone, newest first.
+   Each package is unregistered, and exactly the files and directories this
+   run created are removed. Nothing belonging to other packages is touched.
+
+**Tested:** injecting a failure into every single system call and allocation
+of a four-package install, 482 cases, always ended with all four installed
+or none. **Not covered:** a crash or power loss during step 5 can still leave
+a partial state. The crash test shows `lpm check` always reports it, through
+the staging directories left behind.
+
+### Known limitations
+
+* No upgrades or downgrades: an installed version is final until `lpm
+  remove` exists.
+* Installed packages' own dependencies are not re-examined (`lpm check`
+  reports unsatisfied ones).
+* A cycle is reported for the versions selected. The search does not try
+  other versions just to avoid a cycle.
+* When several conflicts exist, only the first one in search order is
+  reported.
+* Planning reads only metadata, so a candidate with a corrupt payload
+  appears in a plan; `install` rejects it.
+* Candidates come only from a local directory; there are no repositories or
+  downloads.
+
+### Tests
+
+| Program | Tests | Covers |
+|---------|-------|--------|
+| `build/test_solver` | 31 | no dependencies, direct, multiple, transitive, diamond, installed, missing, too old, damaged record; self, 2-, 3- and 5-cycles; determinism; duplicate references; `=`, `>=`, `<`; conflicting requirements; highest compatible version; backtracking; impossible combinations; duplicate candidates; malformed candidates; a 1,024-deep chain and a 200-node graph; every limit; allocation failures |
+| `build/test_deps` | 16 | Scenarios A–G with real `.lpm` files; package-directory handling; conflicts between new packages; `--sha256`; the real-root refusal; a file swapped after planning; every single failure of a multi-package install; a crash at every system call |
+| `tests/run_tests.sh` | 33 new | `lpm plan` and `lpm install --package-dir` end to end |
+
+### Demonstration (temporary directories only)
+
+```sh
+make
+P=$(mktemp -d); R=$(mktemp -d)
+mk() {   # mk NAME VERSION [DEPENDS...]
+    s=$(mktemp -d); mkdir -p $s/payload/usr/share/$1
+    echo "$1 $2" > $s/payload/usr/share/$1/README
+    printf 'name=%s\nversion=%s\n' $1 $2 > $s/metadata.in
+    n=$1; v=$2; shift 2
+    for d in "$@"; do echo "depends=$d" >> $s/metadata.in; done
+    tools/lpm-mkpkg.sh $s $P/$n-$v.lpm gz; rm -rf $s
+}
+mk libc 1.0
+mk liba 1.0 'libc>=1.0'
+mk libb 1.0 'libc>=1.0'
+mk app  1.0 'liba>=1.0' 'libb>=1.0'
+
+./lpm --root $R plan $P/app-1.0.lpm --package-dir $P     # graph + order
+./lpm --root $R install $P/app-1.0.lpm                   # refused: missing liba
+./lpm --root $R install $P/app-1.0.lpm --package-dir $P  # installs libc, liba, libb, app
+./lpm --root $R list
+
+C=$(mktemp -d); P0=$P; P=$C                              # a cycle
+mk cyc-a 1 'cyc-b>=1'; mk cyc-b 1 'cyc-c>=1'; mk cyc-c 1 'cyc-a>=1'
+./lpm --root $(mktemp -d) plan $C/cyc-a-1.lpm --package-dir $C   # cyc-a -> cyc-b -> cyc-c -> cyc-a
+P=$P0
 ```

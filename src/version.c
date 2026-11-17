@@ -75,11 +75,16 @@ lpm_status lpm_version_satisfies(const char *installed_version,
 
     if (requirement == NULL || satisfied == NULL)
         return LPM_ERR_INVALID;
-    if (requirement->op != LPM_DEP_EXACT && requirement->op != LPM_DEP_MINIMUM)
+    if (requirement->op != LPM_DEP_EXACT && requirement->op != LPM_DEP_MINIMUM &&
+        requirement->op != LPM_DEP_BELOW)
         return LPM_ERR_INVALID;
     if (lpm_version_compare(installed_version, requirement->version, &cmp) != LPM_OK)
         return LPM_ERR_INVALID;
 
-    *satisfied = requirement->op == LPM_DEP_EXACT ? cmp == 0 : cmp >= 0;
+    switch (requirement->op) {
+    case LPM_DEP_EXACT:   *satisfied = cmp == 0; break;
+    case LPM_DEP_MINIMUM: *satisfied = cmp >= 0; break;
+    case LPM_DEP_BELOW:   *satisfied = cmp < 0;  break;
+    }
     return LPM_OK;
 }

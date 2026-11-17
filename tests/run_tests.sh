@@ -1,5 +1,5 @@
 #!/bin/bash
-# CLI tests (Milestones 1-4). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo]
+# CLI tests (Milestones 1-5). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo]
 #
 # Every test runs against a throwaway --root directory, never against /.
 
@@ -344,6 +344,105 @@ rmdir "$R4/var/lib/lpm/staging/install.999.0"
 
 run help;                                   check "help: install implemented"           0 out "install <file.lpm> \[--sha256 HEX\]  *Install a local package (not into / yet)$"
 run help;                                   check "help: remove still planned"          0 out "remove <package>.*(planned)$"
+
+
+# --- Milestone 5: dependency planning and installation ---------------
+echo "Running Milestone 5 CLI tests"
+P5="$WORK/m5"
+D5="$P5/pkgs"
+mkdir -p "$D5"
+# mkdep NAME VERSION [DEPENDS...]: one package with one file.
+mkdep() {
+    local name=$1 ver=$2 s; shift 2
+    s=$(mktemp -d "$P5/src.XXXXXX")
+    mkdir -p "$s/payload/usr/share/$name"
+    echo "$name $ver" > "$s/payload/usr/share/$name/README"
+    printf 'name=%s\nversion=%s\n' "$name" "$ver" > "$s/metadata.in"
+    for d in "$@"; do printf 'depends=%s\n' "$d" >> "$s/metadata.in"; done
+    bash "$MKPKG" "$s" "${OUTDIR:-$D5}/$name-$ver.lpm" gz >/dev/null
+    rm -rf "$s"
+}
+mkdep libc 1.0
+mkdep liba 1.2 'libc>=1.0'
+mkdep libb 1.0 'libc>=1.0'
+mkdep app 1.0 'liba>=1.0' 'libb>=1.0'
+
+R11="$P5/root"; mkdir "$R11"
+run --root "$R11" plan "$D5/app-1.0.lpm" --package-dir "$D5"
+                                    check "plan: succeeds"                     0 out "Status: dependency resolution successful"
+                                    check "plan: 1. libc (shared, once)"       0 out "^  1\. libc 1.0  \[transitive dependency\]"
+                                    check "plan: 2. liba"                      0 out "^  2\. liba 1.2  \[direct dependency\]"
+                                    check "plan: 3. libb"                      0 out "^  3\. libb 1.0  \[direct dependency\]"
+                                    check "plan: 4. app last"                  0 out "^  4\. app 1.0  \[requested\]"
+                                    check "plan: shows graph edges"            0 out "-> libc >= 1.0  =>  libc 1.0"
+                                    check "plan: package count"                0 out "^Packages to install: 4$"
+if [ "$(grep -c "libc 1.0  \[" "$WORK/out")" = 1 ]; then ok "plan: libc listed once"; else bad "plan: libc listed once"; fi
+if [ -z "$(ls -A "$R11")" ]; then ok "plan: wrote nothing"; else bad "plan: wrote nothing"; fi
+
+run --root "$R11" install "$D5/app-1.0.lpm"
+                                    check "install: missing deps rejected"     1 err "missing dependency: liba >= 1.0 (required by app 1.0)"
+                                    check "install: says rejected"             1 err "Installation rejected"
+if [ ! -e "$R11/usr" ]; then ok "install: rejection installed nothing"; else bad "install: rejection installed nothing"; fi
+run --root "$R11" install "$D5/app-1.0.lpm" --package-dir "$D5"
+                                    check "install: with --package-dir"        0 out "Dependencies satisfied: 0 already installed, 3 installed now"
+                                    check "install: requested package last"    0 out "Installed app 1.0"
+if [ "$(grep -n 'Installed libc' "$WORK/out" | cut -d: -f1)" -lt "$(grep -n 'Installed app' "$WORK/out" | cut -d: -f1)" ]
+then ok "install: dependency installed first"; else bad "install: dependency installed first"; fi
+run --root "$R11" list;             check "install: four packages listed"      0 out "Installed packages (4)"
+run --root "$R11" check;            check "install: database consistent"       0 out "No problems found"
+run --root "$R11" plan "$D5/app-1.0.lpm" --package-dir "$D5"
+                                    check "plan: already installed"            1 err "already registered"
+
+# Scenario E: an installed dependency satisfies the plan.
+R12="$P5/root-installed"; mkdir "$R12"
+run --root "$R12" install "$D5/libc-1.0.lpm";  check "install: libc alone"     0 out "Installed libc 1.0"
+run --root "$R12" plan "$D5/liba-1.2.lpm" --package-dir "$D5"
+                                    check "plan: installed dep satisfied"      0 out "^  libc 1.0  \[direct dependency\]$"
+                                    check "plan: only liba to install"         0 out "^Packages to install: 1$"
+run --root "$R12" install "$D5/liba-1.2.lpm"
+                                    check "install: installed dep suffices"    0 out "Dependencies satisfied: 1 already installed, 0 installed now"
+
+# Scenario B / C / D: missing, circular, conflicting.
+OUTDIR="$P5/bad"; mkdir -p "$OUTDIR"
+mkdep app2 1.0 'missinglib>=2.0'
+mkdep cyc-a 1 'cyc-b>=1'
+mkdep cyc-b 1 'cyc-c>=1'
+mkdep cyc-c 1 'cyc-a>=1'
+mkdep library 1.0
+mkdep library 3.1
+mkdep needs-new 1 'library>=3.0'
+mkdep needs-old 1 'library<2.0'
+mkdep both 1 'needs-new>=1' 'needs-old>=1'
+OUTDIR=
+R13="$P5/root-bad"; mkdir "$R13"
+run --root "$R13" plan "$P5/bad/app2-1.0.lpm" --package-dir "$P5/bad"
+                                    check "plan: missing dependency"           1 err "missing dependency: missinglib >= 2.0 (required by app2 1.0)"
+                                    check "plan: no plan produced"             1 err "No installation plan was produced"
+run --root "$R13" plan "$P5/bad/cyc-a-1.lpm" --package-dir "$P5/bad"
+                                    check "plan: cycle detected"               1 err "dependency cycle detected: cyc-a -> cyc-b -> cyc-c -> cyc-a"
+run --root "$R13" install "$P5/bad/cyc-a-1.lpm" --package-dir "$P5/bad"
+                                    check "install: cycle rejected"            1 err "dependency cycle detected"
+run --root "$R13" plan "$P5/bad/both-1.lpm" --package-dir "$P5/bad"
+                                    check "plan: version conflict"             1 err "conflicting requirements: library < 2.0 (required by needs-old 1)"
+if [ ! -e "$R13/usr" ] && [ ! -e "$R13/var/lib/lpm/installed/cyc-a.meta" ]
+then ok "plan/install: failures changed nothing"; else bad "plan/install: failures changed nothing"; fi
+
+# Scenario F: a corrupted dependency stops the whole installation.
+T5="$P5/tamper"; mkdir -p "$T5" "$P5/corrupt"
+cp "$D5"/*.lpm "$P5/corrupt/"
+tar -xzf "$D5/libc-1.0.lpm" -C "$T5"
+echo "tampered" > "$T5/payload/usr/share/libc/README"
+tar -czf "$P5/corrupt/libc-1.0.lpm" -C "$T5" metadata.txt manifest.txt payload
+R14="$P5/root-corrupt"; mkdir "$R14"
+run --root "$R14" install "$P5/corrupt/app-1.0.lpm" --package-dir "$P5/corrupt"
+                                    check "install: corrupted dependency"      1 err "INTEGRITY FAILURE: libc 1.0: SHA-256 mismatch"
+if [ ! -e "$R14/usr" ] && [ ! -e "$R14/var/lib/lpm/installed/app.meta" ]
+then ok "install: nothing installed after corruption"; else bad "install: nothing installed after corruption"; fi
+
+run --root "$R11" plan "$D5/app-1.0.lpm" --sha256 abc
+                                    check "plan: rejects --sha256"             2 err "usage"
+run help;                           check "help: plan command"                 0 out "plan <file.lpm> \[--package-dir DIR\]  *Show the dependency plan"
+run help;                           check "help: --package-dir option"         0 out "--package-dir DIR  plan, install"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

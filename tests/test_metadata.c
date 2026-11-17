@@ -746,8 +746,10 @@ static void test_missing_dependency_version(void)
 
 static void test_unsupported_dependency_operators(void)
 {
+    /* Milestone 5 added the strict maximum "<" (approved change), so
+     * "libfoo<1" left this list; every other operator is still refused. */
     static const char *bad[] = {
-        "libfoo<1", "libfoo<=1", "libfoo>1", "libfoo!=1", "libfoo~1", "libfoo^1",
+        "libfoo<=1", "libfoo>1", "libfoo!=1", "libfoo~1", "libfoo^1",
         "libfoo==1", "libfoo>==1", "libfoo~=1", "libfoo=>1", "libfoo=<1",
     };
     size_t i;

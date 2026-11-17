@@ -57,10 +57,50 @@ typedef struct {
 lpm_status lpm_verify_package(const char *path, const char *expected_sha256,
                               lpm_pkg_summary *out, lpm_meta_error *err);
 
-/* Install (see the order above). opt may be NULL for defaults. */
+/*
+ * Install one package whose dependencies must already be installed.
+ * Same as lpm_install_packages() without a package directory; *out
+ * describes the requested package. opt may be NULL for defaults.
+ */
 lpm_status lpm_install_package(const lpm_config *cfg, const char *path,
                                const lpm_install_options *opt,
                                lpm_pkg_summary *out, lpm_meta_error *err);
+
+/* What one installation run installed, dependencies first. */
+typedef struct {
+    lpm_pkg_summary *items;   /* the requested package is the last one */
+    size_t count;
+    size_t satisfied;         /* dependencies that were already installed */
+} lpm_install_report;
+
+void lpm_install_report_free(lpm_install_report *r);
+
+/*
+ * Milestone 5: install a package together with any missing dependencies
+ * found in package_dir (NULL: dependencies must already be installed).
+ *
+ *   1. refuse "/"; check the requested file (and --sha256) first
+ *   2. lock the database; resolve the dependency plan (plan.h) against
+ *      the installed set seen under that lock
+ *   3. verify and stage EVERY package of the plan with the full
+ *      Milestone 4 checks (steps 2-5 above, per package; --sha256 applies
+ *      to the requested file); the verified metadata must equal what the
+ *      plan was built from
+ *   4. check the packages against each other (no shared file)
+ *   5. commit them in dependency order, each: files, then its record
+ *   6. if any package fails at 5, every package of THIS run is undone,
+ *      newest first: its record is removed and exactly the files and
+ *      directories this run created are deleted (nothing else).
+ *
+ * Unsatisfiable dependencies (LPM_ERR_DEPENDENCY) are found in step 2,
+ * before any file is written. A crash (not an ordinary error) during
+ * step 5 can still leave a partial state; lpm check reports it through
+ * the staging directories left behind.
+ */
+lpm_status lpm_install_packages(const lpm_config *cfg, const char *path,
+                                const char *package_dir,
+                                const lpm_install_options *opt,
+                                lpm_install_report *report, lpm_meta_error *err);
 
 /* Is root the real "/" (by device and inode, so "//" or a symlink to /
  * count too)? */

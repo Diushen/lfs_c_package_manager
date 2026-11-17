@@ -184,7 +184,12 @@ bool lpm_is_valid_sha256_hex(const char *hex)
 
 const char *lpm_dep_operator_str(lpm_dep_operator op)
 {
-    return op == LPM_DEP_MINIMUM ? ">=" : "=";
+    switch (op) {
+    case LPM_DEP_MINIMUM: return ">=";
+    case LPM_DEP_BELOW:   return "<";
+    case LPM_DEP_EXACT:   break;
+    }
+    return "=";
 }
 
 /* A well-formed key is [A-Za-z0-9_]+; anything else (spaces, '.', ...)
@@ -435,10 +440,12 @@ static lpm_status field_depends(parser *p, const char *v)
         op = LPM_DEP_MINIMUM;
     } else if (op_len == 1 && op_str[0] == '=') {
         op = LPM_DEP_EXACT;
+    } else if (op_len == 1 && op_str[0] == '<') {
+        op = LPM_DEP_BELOW;     /* Milestone 5: strict maximum */
     } else {
         lpm_meta_error_set(p->err, LPM_META_ERR_INVALID_VALUE, p->line_no, "depends",
                            "invalid dependency '%.*s%s': unsupported operator "
-                           "'%.*s' (only '>=' and '=' are supported)",
+                           "'%.*s' (only '>=', '=' and '<' are supported)",
                            QUOTE_MAX, v, ellipsis(v),
                            (int)(op_len > 8 ? 8 : op_len), op_str);
         return LPM_ERR_INVALID;
@@ -900,7 +907,7 @@ static lpm_status check_package_fields(const lpm_package *pkg,
 
         if (!lpm_is_valid_package_name(d->name) ||
             !lpm_is_valid_version(d->version) ||
-            (d->op != LPM_DEP_EXACT && d->op != LPM_DEP_MINIMUM)) {
+            (d->op != LPM_DEP_EXACT && d->op != LPM_DEP_MINIMUM && d->op != LPM_DEP_BELOW)) {
             lpm_meta_error_set(err, LPM_META_ERR_INVALID_VALUE, 0, "depends",
                                "dependency %zu is invalid", i + 1);
             return LPM_ERR_INVALID;

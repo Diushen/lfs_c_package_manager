@@ -145,6 +145,7 @@ const char *lpm_status_str(lpm_status status)
     case LPM_ERR_CONFLICT:        return "file ownership conflict";
     case LPM_ERR_INTEGRITY:       return "integrity check failed";
     case LPM_ERR_CRYPTO:          return "cryptographic library error";
+    case LPM_ERR_DEPENDENCY:      return "dependency resolution failed";
     }
     return "unknown error";
 }

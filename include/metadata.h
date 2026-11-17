@@ -9,6 +9,7 @@
  *   description=A simple hello world program
  *   depends=libfoo>=1.0
  *   depends=libbar=2.1
+ *   depends=libold<3        (strict maximum, Milestone 5)
  *   manifest_sha256=<64 lowercase hex digits>
  *
  * The parser is a pure function of its input bytes: it performs no
@@ -44,7 +45,8 @@
 
 typedef enum {
     LPM_DEP_EXACT,     /* name=VERSION  */
-    LPM_DEP_MINIMUM    /* name>=VERSION */
+    LPM_DEP_MINIMUM,   /* name>=VERSION */
+    LPM_DEP_BELOW      /* name<VERSION  (strict maximum; Milestone 5) */
 } lpm_dep_operator;
 
 /* One "depends=" entry. Strings are owned by the enclosing lpm_package. */
@@ -114,8 +116,16 @@ typedef enum {
     LPM_META_ERR_HASH_MISMATCH,    /* SHA-256 differs from the expected  */
     LPM_META_ERR_CRYPTO,           /* OpenSSL failed                     */
     LPM_META_ERR_ARCHIVE,          /* unreadable / corrupt / unsupported */
-    LPM_META_ERR_UNSAFE_ENTRY      /* traversal, absolute path, symlink, */
+    LPM_META_ERR_UNSAFE_ENTRY,     /* traversal, absolute path, symlink, */
                                    /* hard link or special file          */
+    /* Added in Milestone 5 (dependency resolution). */
+    LPM_META_ERR_DEP_MISSING,      /* no installed or available package  */
+    LPM_META_ERR_DEP_INSTALLED,    /* installed version does not fit     */
+    LPM_META_ERR_DEP_CONFLICT,     /* no version satisfies every demand  */
+    LPM_META_ERR_DEP_CYCLE,        /* circular dependency                */
+    LPM_META_ERR_DEP_DUPLICATE,    /* two candidates, same name+version  */
+    LPM_META_ERR_DEP_LIMIT,        /* graph / search size limit reached  */
+    LPM_META_ERR_DEP_ALREADY       /* requested package already installed */
 } lpm_meta_error_code;
 
 /*
@@ -247,7 +257,7 @@ bool lpm_is_valid_version(const char *version);
 /* Exactly 64 characters from [0-9a-f]. Uppercase is rejected. */
 bool lpm_is_valid_sha256_hex(const char *hex);
 
-/* ">=" or "=" */
+/* ">=", "=" or "<" */
 const char *lpm_dep_operator_str(lpm_dep_operator op);
 
 #endif /* LPM_METADATA_H */

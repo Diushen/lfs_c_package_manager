@@ -8,6 +8,7 @@
 #include "commands.h"
 #include "database.h"
 #include "install.h"
+#include "plan.h"
 #include "metadata.h"
 #include "util.h"
 
@@ -23,6 +24,7 @@ static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_plan(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_not_implemented(const lpm_config *cfg, int argc, char **argv);
 
 static const lpm_command commands[] = {
@@ -32,7 +34,8 @@ static const lpm_command commands[] = {
     { "list",    "",             "List installed packages",                0, 0, 1, cmd_list },
     { "info",    "<package>",    "Show details of an installed package",   1, 1, 1, cmd_info },
     { "verify",  "<file.lpm> [--sha256 HEX]", "Verify a package's SHA-256 integrity", 1, 3, 1, cmd_verify },
-    { "install", "<file.lpm> [--sha256 HEX]", "Install a local package (not into / yet)", 1, 3, 1, cmd_install },
+    { "plan",    "<file.lpm> [--package-dir DIR]", "Show the dependency plan (changes nothing)", 1, 3, 1, cmd_plan },
+    { "install", "<file.lpm> [--sha256 HEX]", "Install a local package (not into / yet)", 1, 5, 1, cmd_install },
     { "remove",  "<package>",    "Remove an installed package",            1, 1, 0, cmd_not_implemented },
     { "check",   "",             "Check database consistency",             0, 0, 1, cmd_check },
 };
@@ -74,9 +77,14 @@ void lpm_print_help(void)
         char synopsis[80];
         snprintf(synopsis, sizeof(synopsis), "%s %s",
                  commands[i].name, commands[i].usage);
-        printf("  %-34s %s%s\n", synopsis, commands[i].summary,
+        printf("  %-36s %s%s\n", synopsis, commands[i].summary,
                commands[i].implemented ? "" : " (planned)");
     }
+
+    printf("\nPackage options:\n");
+    printf("  --sha256 HEX       verify, install: expected SHA-256 of the package file\n");
+    printf("  --package-dir DIR  plan, install: local .lpm files that may satisfy\n");
+    printf("                     dependencies (install installs them too, all or nothing)\n");
 }
 
 lpm_status lpm_run_command(const lpm_command *cmd, const lpm_config *cfg,
@@ -275,19 +283,33 @@ static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv)
     return LPM_OK;
 }
 
-/* Parse "<file> [--sha256 HEX]" (argv[0] is the command name). */
-static lpm_status package_args(int argc, char **argv, const char **file,
-                               const char **sha256)
+/* Options a package command may accept. */
+#define OPT_SHA256       1u
+#define OPT_PACKAGE_DIR  2u
+
+/* Parse "<file> [--sha256 HEX] [--package-dir DIR]" (argv[0] = command). */
+static lpm_status package_args(int argc, char **argv, unsigned allowed,
+                               const char *usage, const char **file,
+                               const char **sha256, const char **package_dir)
 {
+    int i;
+
     *file = argv[1];
     *sha256 = NULL;
-    if (argc == 2)
-        return LPM_OK;
-    if (argc == 4 && strcmp(argv[2], "--sha256") == 0) {
-        *sha256 = argv[3];
-        return LPM_OK;
+    *package_dir = NULL;
+    for (i = 2; i < argc; i += 2) {
+        const char **slot = NULL;
+        if ((allowed & OPT_SHA256) && strcmp(argv[i], "--sha256") == 0)
+            slot = sha256;
+        else if ((allowed & OPT_PACKAGE_DIR) && strcmp(argv[i], "--package-dir") == 0)
+            slot = package_dir;
+        if (slot == NULL || *slot != NULL || i + 1 >= argc)
+            goto usage;
+        *slot = argv[i + 1];
     }
-    lpm_error("usage: %s %s <file.lpm> [--sha256 HEX]", LPM_PROGRAM_NAME, argv[0]);
+    return LPM_OK;
+usage:
+    lpm_error("usage: %s %s %s", LPM_PROGRAM_NAME, argv[0], usage);
     lpm_print_usage_hint();
     return LPM_ERR_USAGE;
 }
@@ -302,13 +324,14 @@ static void report_package_error(const char *what, const char *file,
 
 static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv)
 {
-    const char *file, *sha256;
+    const char *file, *sha256, *unused;
     lpm_pkg_summary s;
     lpm_meta_error err;
     lpm_status rc;
 
     (void)cfg;   /* verification reads only the package file */
-    rc = package_args(argc, argv, &file, &sha256);
+    rc = package_args(argc, argv, OPT_SHA256, "<file.lpm> [--sha256 HEX]",
+                      &file, &sha256, &unused);
     if (rc != LPM_OK)
         return rc;
     rc = lpm_verify_package(file, sha256, &s, &err);
@@ -329,34 +352,120 @@ static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv)
     return LPM_OK;
 }
 
+static const char *node_role(const lpm_plan_node *n)
+{
+    if (n->depth == 0)
+        return "requested";
+    return n->depth == 1 ? "direct dependency" : "transitive dependency";
+}
+
+/* Read-only: prints the graph and the order; writes nothing. */
+static lpm_status cmd_plan(const lpm_config *cfg, int argc, char **argv)
+{
+    const char *file, *unused, *dir;
+    lpm_resolution r;
+    lpm_meta_error err;
+    lpm_status rc;
+    size_t i, j;
+
+    rc = package_args(argc, argv, OPT_PACKAGE_DIR, "<file.lpm> [--package-dir DIR]",
+                      &file, &unused, &dir);
+    if (rc != LPM_OK)
+        return rc;
+    rc = lpm_resolve_request(cfg, file, dir, false, &r, &err);
+    if (rc != LPM_OK) {
+        lpm_error("dependency resolution failed for %s: %s", file,
+                  err.message[0] ? err.message : lpm_status_str(rc));
+        fprintf(stderr, "No installation plan was produced; nothing was changed.\n");
+        return rc;
+    }
+
+    printf("LPM dependency resolution (root '%s')\n\n", cfg->root);
+    printf("Requested:\n  %s %s  (%s)\n\n", r.plan.nodes[0].pkg->name,
+           r.plan.nodes[0].pkg->version, r.plan.nodes[0].source);
+
+    printf("Dependency graph (package -> requirement => selected):\n");
+    for (i = 0; i < r.plan.count; i++) {
+        const lpm_plan_node *n = &r.plan.nodes[i];
+        if (n->kind != LPM_NODE_INSTALL)
+            continue;
+        printf("  %s %s\n", n->pkg->name, n->pkg->version);
+        if (n->pkg->dependency_count == 0)
+            printf("      (no dependencies)\n");
+        for (j = 0; j < n->pkg->dependency_count; j++) {
+            const lpm_dependency *d = &n->pkg->dependencies[j];
+            const lpm_plan_node *t = &r.plan.nodes[n->edges[j]];
+            printf("      -> %s %s %s  =>  %s %s%s\n", d->name,
+                   lpm_dep_operator_str(d->op), d->version, t->pkg->name,
+                   t->pkg->version, t->kind == LPM_NODE_INSTALLED ? " (installed)" : "");
+        }
+    }
+
+    printf("\nInstallation order (dependencies first):\n");
+    for (i = 0; i < r.plan.order_count; i++) {
+        const lpm_plan_node *n = &r.plan.nodes[r.plan.order[i]];
+        printf("  %zu. %s %s  [%s]  %s\n", i + 1, n->pkg->name, n->pkg->version,
+               node_role(n), n->source);
+    }
+    printf("\nAlready installed (satisfied):\n");
+    if (r.plan.satisfied == 0)
+        printf("  (none)\n");
+    for (i = 0; i < r.plan.count; i++) {
+        const lpm_plan_node *n = &r.plan.nodes[i];
+        if (n->kind == LPM_NODE_INSTALLED)
+            printf("  %s %s  [%s]\n", n->pkg->name, n->pkg->version, node_role(n));
+    }
+    printf("\nPackages to install: %zu\nAlready satisfied:   %zu\n",
+           r.plan.order_count, r.plan.satisfied);
+    printf("Status: dependency resolution successful (%zu candidate attempt%s). "
+           "Only metadata was read: every package is fully verified when "
+           "installed.\n", r.plan.steps, r.plan.steps == 1 ? "" : "s");
+    lpm_resolution_free(&r);
+    return LPM_OK;
+}
+
 static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv)
 {
     lpm_install_options opt;
-    const char *file, *sha256;
-    lpm_pkg_summary s;
+    const char *file, *sha256, *dir;
+    lpm_install_report rep;
     lpm_meta_error err;
     lpm_status rc;
+    size_t i;
 
-    rc = package_args(argc, argv, &file, &sha256);
+    rc = package_args(argc, argv, OPT_SHA256 | OPT_PACKAGE_DIR,
+                      "<file.lpm> [--sha256 HEX] [--package-dir DIR]",
+                      &file, &sha256, &dir);
     if (rc != LPM_OK)
         return rc;
     opt.expected_sha256 = sha256;
     opt.allow_real_root = false;   /* never from the CLI until signatures */
     opt.lock_wait_ms = 5000;
-    rc = lpm_install_package(cfg, file, &opt, &s, &err);
+    rc = lpm_install_packages(cfg, file, dir, &opt, &rep, &err);
     if (rc != LPM_OK) {
         report_package_error("cannot install", file, rc, &err);
-        if (rc == LPM_ERR_INTEGRITY || rc == LPM_ERR_INVALID ||
-            rc == LPM_ERR_CONFLICT || rc == LPM_ERR_EXISTS)
+        if (rc == LPM_ERR_DEPENDENCY)
+            fprintf(stderr, "Installation rejected: dependencies are not satisfied%s.\n",
+                    dir ? "" : " (use --package-dir DIR to install them from local "
+                               "packages)");
+        if (rc != LPM_ERR_USAGE && rc != LPM_ERR_NOT_FOUND && rc != LPM_ERR_NOMEM)
             fprintf(stderr, "Nothing was installed and the database is unchanged.\n");
         return rc;
     }
-    printf("Installed %s %s into '%s': %zu file%s, %zu symlink%s, %zu "
-           "director%s (%ju bytes).\n", s.name, s.version, cfg->root,
-           s.files, s.files == 1 ? "" : "s", s.symlinks, s.symlinks == 1 ? "" : "s",
-           s.dirs, s.dirs == 1 ? "y" : "ies", (uintmax_t)s.bytes);
-    printf("Every file matched its SHA-256 before it was placed. The package "
-           "is not authenticated (no signature check yet).\n");
+    printf("Dependencies satisfied: %zu already installed, %zu installed now.\n",
+           rep.satisfied, rep.count - 1);
+    for (i = 0; i < rep.count; i++) {
+        const lpm_pkg_summary *s = &rep.items[i];
+        printf("Installed %s %s into '%s': %zu file%s, %zu symlink%s, %zu "
+               "director%s (%ju bytes).\n", s->name, s->version, cfg->root,
+               s->files, s->files == 1 ? "" : "s", s->symlinks,
+               s->symlinks == 1 ? "" : "s", s->dirs, s->dirs == 1 ? "y" : "ies",
+               (uintmax_t)s->bytes);
+    }
+    printf("Every file matched its SHA-256 before it was placed. The package%s "
+           "%s not authenticated (no signature check yet).\n",
+           rep.count == 1 ? "" : "s", rep.count == 1 ? "is" : "are");
+    lpm_install_report_free(&rep);
     return LPM_OK;
 }
 

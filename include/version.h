@@ -43,6 +43,7 @@ lpm_status lpm_version_compare(const char *a, const char *b, int *result);
  *
  *   LPM_DEP_EXACT    installed == required   (numerically: 2.0 == 2.0.0)
  *   LPM_DEP_MINIMUM  installed >= required
+ *   LPM_DEP_BELOW    installed <  required   (strict: 2.0 is not < 2.0.0)
  *
  * Only versions are compared: requirement->name is ignored, and the
  * database is not consulted.

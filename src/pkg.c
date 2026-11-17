@@ -258,6 +258,33 @@ static lpm_status payload_entry(lpm_archive *a, lpm_pkg *p, const lpm_archive_en
     return LPM_ERR_INVALID;
 }
 
+lpm_status lpm_pkg_read_metadata(int fd, lpm_package *out, lpm_meta_error *err)
+{
+    lpm_archive *a = NULL;
+    lpm_archive_entry e;
+    char *raw = NULL;
+    size_t len;
+    lpm_status rc;
+
+    lpm_package_init(out);
+    rc = lpm_archive_open_fd(fd, &a, err);
+    if (rc == LPM_OK)
+        rc = expect_entry(a, &e, LPM_PKG_METADATA, err);
+    if (rc == LPM_OK)
+        rc = read_small(a, &e, LPM_META_MAX_FILE_SIZE, &raw, &len, err);
+    if (rc == LPM_OK) {
+        rc = lpm_metadata_parse_buffer(raw, len, LPM_META_DISTRIBUTABLE, out, err);
+        if (rc == LPM_ERR_INVALID && err != NULL) {
+            lpm_meta_error orig = *err;
+            lpm_meta_error_set(err, orig.code, orig.line, orig.field,
+                               "metadata.txt: %.200s", orig.message);
+        }
+    }
+    free(raw);
+    lpm_archive_close(a);
+    return rc;
+}
+
 lpm_status lpm_pkg_read(int fd, int stage_fd, lpm_pkg *out, lpm_meta_error *err)
 {
     char digest[LPM_SHA256_HEX_LEN + 1];

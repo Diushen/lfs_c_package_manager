@@ -48,13 +48,14 @@ OBJ  = $(SRC:src/%.c=build/%.o)
 CORE_OBJ = build/util.o build/metadata.o build/version.o build/filelist.o
 DB_OBJ   = $(CORE_OBJ) build/database.o
 PKG_OBJ  = $(DB_OBJ) build/integrity.o build/safefs.o build/archive.o \
-           build/manifest.o build/pkg.o build/install.o
+           build/manifest.o build/pkg.o build/install.o build/solver.o \
+           build/plan.o
 
 # Unit tests live in tests/ (never matched by the src/*.c wildcard, so
 # they cannot end up in the lpm binary).
 TEST_BIN      = build/test_metadata build/test_version build/test_filelist \
                 build/test_database build/test_integrity build/test_archive \
-                build/test_install
+                build/test_install build/test_solver build/test_deps
 DEMO_BIN      = build/lpm-db-demo
 # GNU ld --wrap lets a test intercept a function to inject failures:
 # allocation failures everywhere, and system-call failures (short
@@ -105,6 +106,13 @@ build/test_archive: build/test_archive.o build/archive.o build/safefs.o build/fi
 build/test_install: build/test_install.o $(PKG_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(INSTALL_WRAP) -o $@ $^ $(LPM_LIBS) $(LDLIBS)
 
+build/test_solver: build/test_solver.o build/solver.o build/version.o build/metadata.o \
+                   build/util.o
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) -o $@ $^ $(LDLIBS)
+
+build/test_deps: build/test_deps.o $(PKG_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(INSTALL_WRAP) -Wl,--wrap=lpm_pkg_read -o $@ $^ $(LPM_LIBS) $(LDLIBS)
+
 $(DEMO_BIN): build/lpm-db-demo.o $(DB_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
@@ -128,6 +136,8 @@ test: $(BIN) $(TEST_BIN) $(DEMO_BIN)
 	./build/test_integrity
 	./build/test_archive
 	./build/test_install
+	./build/test_solver
+	./build/test_deps
 
 unit-test: $(TEST_BIN)
 	./build/test_metadata tests/fixtures
@@ -137,6 +147,8 @@ unit-test: $(TEST_BIN)
 	./build/test_integrity
 	./build/test_archive
 	./build/test_install
+	./build/test_solver
+	./build/test_deps
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)

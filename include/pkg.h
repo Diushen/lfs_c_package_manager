@@ -60,6 +60,14 @@ void lpm_pkg_free(lpm_pkg *p);
  */
 lpm_status lpm_pkg_read(int fd, int stage_fd, lpm_pkg *out, lpm_meta_error *err);
 
+/*
+ * Milestone 5: read and strictly parse only metadata.txt (the first
+ * entry), for dependency planning. This is NOT verification: nothing
+ * else in the archive is looked at. Installation always runs the full
+ * lpm_pkg_read() on every package it installs.
+ */
+lpm_status lpm_pkg_read_metadata(int fd, lpm_package *out, lpm_meta_error *err);
+
 /* "f000042" for manifest entry 42. buf must hold 16 bytes. */
 void lpm_pkg_stage_name(size_t index, char buf[16]);
 
