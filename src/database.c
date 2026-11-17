@@ -1026,18 +1026,24 @@ out:
     return rc;
 }
 
-lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
+/*
+ * Steps 1-3 of a registration: everything that can be checked without
+ * writing. Shared by lpm_db_register_package() and
+ * lpm_db_check_register(), so a pre-flight check uses exactly the same
+ * rules as the real thing. On success the caller owns both buffers.
+ */
+static lpm_status prepare_register(lpm_db *db, const lpm_package *pkg,
                                    const lpm_file_list *files,
-                                   lpm_meta_error *err)
+                                   char **meta_buf, size_t *meta_len,
+                                   char **list_buf, size_t *list_len,
+                                   char *meta, char *list, lpm_meta_error *err)
 {
     static const lpm_file_list empty = { NULL, 0, 0 };
-    char meta[RECORD_NAME_MAX], list[RECORD_NAME_MAX];
-    char *meta_buf = NULL, *list_buf = NULL;
-    size_t meta_len, list_len;
     struct stat st;
-    bool present, renamed;
+    bool present;
     lpm_status rc;
 
+    *meta_buf = *list_buf = NULL;
     err_clear(err);
     rc = require_writer(db, err);
     if (rc != LPM_OK)
@@ -1051,21 +1057,21 @@ lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
         files = &empty;
 
     /* 1. Validate and serialise everything before touching the disk. */
-    rc = lpm_metadata_serialize(pkg, LPM_META_INSTALLED, &meta_buf, &meta_len, err);
+    rc = lpm_metadata_serialize(pkg, LPM_META_INSTALLED, meta_buf, meta_len, err);
     if (rc != LPM_OK)
-        goto out;
-    rc = lpm_file_list_serialize(files, &list_buf, &list_len, err);
+        goto fail;
+    rc = lpm_file_list_serialize(files, list_buf, list_len, err);
     if (rc != LPM_OK)
-        goto out;
+        goto fail;
 
-    record_name(meta, sizeof(meta), pkg->name, LPM_META_SUFFIX);
-    record_name(list, sizeof(list), pkg->name, LPM_LIST_SUFFIX);
+    record_name(meta, RECORD_NAME_MAX, pkg->name, LPM_META_SUFFIX);
+    record_name(list, RECORD_NAME_MAX, pkg->name, LPM_LIST_SUFFIX);
 
     /* 2. Duplicate registration (we hold the lock, so this cannot race
      *    with another cooperating LPM process). */
     rc = lookup_entry(db->installed_fd, meta, LPM_DB_INSTALLED_DIR, &present, &st, err);
     if (rc != LPM_OK)
-        goto out;
+        goto fail;
     if (present) {
         if (S_ISREG(st.st_mode)) {
             lpm_meta_error_set(err, LPM_META_ERR_STATE, 0, "name",
@@ -1077,24 +1083,61 @@ lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
                                describe_type(st.st_mode));
             rc = LPM_ERR_INVALID;
         }
-        goto out;
+        goto fail;
     }
     /* An orphaned regular .list may be replaced; anything else is odd. */
     rc = lookup_entry(db->files_fd, list, LPM_DB_FILES_DIR, &present, &st, err);
     if (rc != LPM_OK)
-        goto out;
+        goto fail;
     if (present && !S_ISREG(st.st_mode)) {
         lpm_meta_error_set(err, LPM_META_ERR_UNTRUSTED, 0, NULL,
                            "files/%s is %s; refusing to touch it", list,
                            describe_type(st.st_mode));
         rc = LPM_ERR_INVALID;
-        goto out;
+        goto fail;
     }
 
     /* 3. No path may already belong to another registered package. */
     rc = check_ownership(db, files, err);
     if (rc != LPM_OK)
-        goto out;
+        goto fail;
+    return LPM_OK;
+
+fail:
+    free(*meta_buf);
+    free(*list_buf);
+    *meta_buf = *list_buf = NULL;
+    return rc;
+}
+
+lpm_status lpm_db_check_register(lpm_db *db, const lpm_package *pkg,
+                                 const lpm_file_list *files, lpm_meta_error *err)
+{
+    char meta[RECORD_NAME_MAX], list[RECORD_NAME_MAX];
+    char *meta_buf, *list_buf;
+    size_t meta_len, list_len;
+    lpm_status rc = prepare_register(db, pkg, files, &meta_buf, &meta_len,
+                                     &list_buf, &list_len, meta, list, err);
+
+    free(meta_buf);
+    free(list_buf);
+    return rc;
+}
+
+lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
+                                   const lpm_file_list *files,
+                                   lpm_meta_error *err)
+{
+    char meta[RECORD_NAME_MAX], list[RECORD_NAME_MAX];
+    char *meta_buf, *list_buf;
+    size_t meta_len, list_len;
+    bool renamed;
+    lpm_status rc;
+
+    rc = prepare_register(db, pkg, files, &meta_buf, &meta_len, &list_buf,
+                          &list_len, meta, list, err);
+    if (rc != LPM_OK)
+        return rc;
 
     /* 4. Write the file list, then the record (the commit point). */
     rc = atomic_write(db->files_fd, LPM_DB_FILES_DIR, list, list_buf, list_len,
@@ -1118,6 +1161,88 @@ lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
 out:
     free(meta_buf);
     free(list_buf);
+    return rc;
+}
+
+/* ---- Staging area (Milestone 4) ---------------------------------------- */
+
+lpm_status lpm_db_open_staging(lpm_db *db, int *out_fd, char name[LPM_DB_STAGE_NAME_MAX],
+                               lpm_meta_error *err)
+{
+    static unsigned long counter;
+    int stage_dir, fd, attempt;
+    lpm_status rc;
+
+    *out_fd = -1;
+    name[0] = '\0';
+    rc = require_writer(db, err);
+    if (rc != LPM_OK)
+        return rc;
+    /* var/lib/lpm/staging: same trust rules as every database directory. */
+    rc = open_dir_at(db->lpm_fd, LPM_DB_STAGING_DIR,
+                     LPM_DB_SUBDIR "/" LPM_DB_STAGING_DIR, true, &stage_dir, err);
+    if (rc != LPM_OK)
+        return rc;
+    for (attempt = 0; attempt < 100; attempt++) {
+        snprintf(name, LPM_DB_STAGE_NAME_MAX, "install.%ld.%lu", (long)getpid(),
+                 counter++);
+        if (mkdirat(stage_dir, name, 0700) == 0)
+            break;
+        if (errno != EEXIST) {
+            lpm_meta_error_set(err, LPM_META_ERR_IO, 0, NULL,
+                               "cannot create a staging directory: %s", strerror(errno));
+            close(stage_dir);
+            name[0] = '\0';
+            return LPM_ERR_IO;
+        }
+    }
+    fd = attempt < 100 ? openat(stage_dir, name, O_RDONLY | O_DIRECTORY |
+                                                 O_NOFOLLOW | O_CLOEXEC) : -1;
+    if (fd < 0) {
+        lpm_meta_error_set(err, LPM_META_ERR_IO, 0, NULL,
+                           "cannot open the staging directory: %s", strerror(errno));
+        if (attempt < 100)
+            (void)unlinkat(stage_dir, name, AT_REMOVEDIR);
+        close(stage_dir);
+        name[0] = '\0';
+        return LPM_ERR_IO;
+    }
+    close(stage_dir);
+    *out_fd = fd;
+    return LPM_OK;
+}
+
+static lpm_status unlink_stage_entry(void *ctx, const char *fname)
+{
+    int *fd = ctx;
+    (void)unlinkat(*fd, fname, 0);
+    return LPM_OK;
+}
+
+lpm_status lpm_db_remove_staging(lpm_db *db, int stage_fd, const char *name,
+                                 lpm_meta_error *err)
+{
+    int stage_dir;
+    lpm_status rc;
+
+    if (stage_fd < 0 || name == NULL || name[0] == '\0')
+        return LPM_OK;
+    /* Only flat files live in a staging directory (pkg.c writes f000001...). */
+    rc = for_each_entry(stage_fd, "staging", unlink_stage_entry, &stage_fd, err);
+    close(stage_fd);
+    if (rc != LPM_OK)
+        return rc;
+    rc = open_dir_at(db->lpm_fd, LPM_DB_STAGING_DIR,
+                     LPM_DB_SUBDIR "/" LPM_DB_STAGING_DIR, false, &stage_dir, err);
+    if (rc != LPM_OK)
+        return rc;
+    if (unlinkat(stage_dir, name, AT_REMOVEDIR) != 0) {
+        lpm_meta_error_set(err, LPM_META_ERR_IO, 0, NULL,
+                           "cannot remove staging directory %s: %s", name,
+                           strerror(errno));
+        rc = LPM_ERR_IO;
+    }
+    close(stage_dir);
     return rc;
 }
 
@@ -1450,6 +1575,41 @@ static lpm_status check_conflicts(check_state *cs)
     return LPM_OK;
 }
 
+/* An installer that died leaves its staging directory behind (it removes
+ * it only after the record is written). While an install runs it holds
+ * the exclusive lock, so a check (shared lock) never sees a live one. */
+static lpm_status check_staging_entry(void *ctx, const char *fname)
+{
+    check_state *cs = ctx;
+
+    report(cs, LPM_CHECK_STALE_TEMP, LPM_DB_STAGING_DIR, fname,
+           "left behind by an interrupted installation; files of that package "
+           "may be partly installed without a record (nothing was deleted)");
+    return LPM_OK;
+}
+
+static lpm_status check_staging(check_state *cs)
+{
+    int fd;
+    lpm_status rc = open_dir_at(cs->db->lpm_fd, LPM_DB_STAGING_DIR,
+                                LPM_DB_SUBDIR "/" LPM_DB_STAGING_DIR, false, &fd,
+                                cs->err);
+
+    if (rc == LPM_ERR_NOT_FOUND) {
+        err_clear(cs->err);
+        return LPM_OK;   /* nothing was ever installed */
+    }
+    if (rc != LPM_OK) {
+        report(cs, LPM_CHECK_UNEXPECTED_ENTRY, LPM_DB_SUBDIR, LPM_DB_STAGING_DIR,
+               "%s", cs->err ? cs->err->message : "unusable staging directory");
+        err_clear(cs->err);
+        return LPM_OK;
+    }
+    rc = for_each_entry(fd, LPM_DB_STAGING_DIR, check_staging_entry, cs, cs->err);
+    close(fd);
+    return rc;
+}
+
 static void check_dependencies(check_state *cs)
 {
     size_t i, j;
@@ -1532,6 +1692,7 @@ lpm_status lpm_db_check(lpm_db *db, lpm_check_fn fn, void *ctx,
     if (rc != LPM_OK)
         goto out;
     check_dependencies(&cs);
+    rc = check_staging(&cs);
 
 out:
     for (i = 0; i < cs.n; i++) {

@@ -14,15 +14,16 @@ system.
 | 1         | Skeleton, CLI, `help`, `version`, `list`          | done  |
 | 2         | Metadata parser, package structures, `info`       | done  |
 | 3         | Version comparison, locked atomic database writes, file ownership, `check` | done |
-| 4–12      | dependency graph, archive, SHA-256, Ed25519, install, remove | planned |
+| 4         | Package archives (libarchive), SHA-256 integrity (OpenSSL), `verify`, `install` | done |
+| 5–12      | dependency graph, Ed25519 signatures, remove, ... | planned |
 
-`lpm install`, `lpm remove` and `lpm verify` are still **not implemented**.
-Milestone 3 can *record* packages in the database (through the demo tool
-below), but recording is bookkeeping, not installation.
+`lpm install` checks **integrity** (SHA-256), not **authenticity**: until
+Ed25519 signatures arrive it refuses to install into the real `/` and only
+works with `--root DIR`. `lpm remove` is not implemented yet.
 
 ## Build and test
 
-    make              # release build of lpm (-O2), no external libraries
+    make              # release build of lpm (-O2)
     make test         # build everything, run CLI tests + all unit tests
     make debug        # rebuild with AddressSanitizer + UBSan ...
     make test         # ... and test that build (debug stays active until `make clean`)
@@ -35,6 +36,12 @@ below), but recording is bookkeeping, not installation.
     build/test_version  -v
     build/test_filelist -v
     build/test_database -v                  # also prints each injected fault
+    build/test_integrity -v / test_archive -v / test_install -v   (Milestone 4)
+
+Requirements: GCC (C11), GNU make, binutils, **OpenSSL** (libcrypto, part of
+base LFS) and **libarchive** built with zlib and liblzma (BLFS; zlib and xz
+are in base LFS). `pkg-config`/`pkgconf` is used when present; otherwise
+`-larchive -lcrypto`. The CLI tests also use GNU tar and `sha256sum`.
 
 The unit tests use GNU ld `--wrap` (binutils is part of base LFS) to inject
 allocation failures and, for the database, system-call failures.
@@ -49,6 +56,8 @@ allocation failures and, for the database, system-call failures.
     lpm --root ./demo-root list
     lpm --root ./demo-root info hello
     lpm --root ./demo-root check
+    lpm verify hello.lpm [--sha256 HEX]
+    lpm --root ./demo-root install hello.lpm [--sha256 HEX]
 
 ## Layout
 
@@ -59,28 +68,44 @@ allocation failures and, for the database, system-call failures.
       version.h         version ordering, constraint evaluation         (M3)
       filelist.h        file-ownership records                          (M3)
       database.h        installed-package database                      (M1-M3)
+      integrity.h       SHA-256 via OpenSSL EVP                         (M4)
+      lpm_archive.h     the only libarchive user; safe extraction       (M4)
+      safefs.h          symlink-refusing, root-relative file creation   (M4)
+      manifest.h        manifest.txt parser                             (M4)
+      pkg.h             reading + verifying a .lpm package              (M4)
+      install.h         verify / install pipeline                       (M4)
       commands.h        command table
     src/                implementation of each header + main.c
     tools/
       lpm-db-demo.c     demonstration driver for the database API       (M3)
+      lpm-mkpkg.sh      builds .lpm packages (bash, coreutils, GNU tar)  (M4)
     tests/
-      run_tests.sh      CLI tests (Milestones 1-3)
+      run_tests.sh      CLI tests (Milestones 1-4)
       test_framework.h  tiny shared test framework                      (M3)
       test_metadata.c   metadata parser unit tests                      (M2)
       test_version.c    version comparison unit tests                   (M3)
       test_filelist.c   file-list unit tests                            (M3)
       test_database.c   database unit tests with fault injection        (M3)
+      test_integrity.c  SHA-256 known-answer and error tests            (M4)
+      test_archive.c    safe extraction and attack tests                (M4)
+      test_install.c    end-to-end install, tampering, faults, crashes  (M4)
       fixtures/         example valid/invalid metadata files            (M2)
     examples/           demonstration packages (later milestones)
 
 Module dependencies point one way only:
 
-    main.c ─► commands.c ─► database.c ─┬─► filelist.c ─┐
-                                        ├─► version.c ──┼─► metadata.c ─► util.c
-                                        └───────────────┘
+    main.c ─► commands.c ─► install.c ─► pkg.c ─┬─► manifest.c
+                     │                 │        ├─► archive.c ──► libarchive
+                     │                 │        └─► integrity.c ─► OpenSSL
+                     │                 └─► safefs.c
+                     └─────────────► database.c ─┬─► filelist.c ─┐
+                                                 ├─► version.c ──┼─► metadata.c ─► util.c
+                                                 └───────────────┘
 
 `metadata.c` knows nothing about the database or the CLI, and `version.c`
-touches no files. Each unit-test binary links only the modules it tests
+touches no files. Only `archive.c` includes libarchive and only
+`integrity.c` includes OpenSSL, so either library could be replaced by
+changing one file. Each unit-test binary links only the modules it tests
 (`test_version` = version + metadata + util), which shows those boundaries
 are real.
 
@@ -750,3 +775,209 @@ rm -rf "$R"
   read a consistent snapshot of the installed set.
 * **Conflict checks:** file lists and `lpm_owned_paths_conflicts()` are ready
   for the installer to reject a package before extraction.
+
+---
+
+## Archives, SHA-256 and installation (Milestone 4)
+
+### Package format (`.lpm`)
+
+A `.lpm` file is a tar archive (ustar, pax or GNU), either uncompressed or
+compressed with gzip or xz. Its entries come in this order:
+
+| Entry | Content |
+|-------|---------|
+| `metadata.txt` | Milestone 2 format, DISTRIBUTABLE profile (needs `manifest_sha256`) |
+| `manifest.txt` | one line per payload object: `file <sha256> <mode> <path>`, `symlink <target> <path>`, `dir <mode> <path>` |
+| `payload/...`  | the files, e.g. `payload/usr/bin/hello` becomes `<root>/usr/bin/hello` |
+
+Build one with `tools/lpm-mkpkg.sh SRCDIR OUT.lpm [none|gz|xz]`. `SRCDIR`
+holds `metadata.in` (no `manifest_sha256`) and `payload/`.
+
+### Libraries
+
+* **libarchive** reads the archive. It detects the compression
+  automatically, but only the tar format and the gzip and xz filters are
+  enabled. If libarchive would fall back to running an external program
+  (`xz -d`), LPM refuses instead.
+  * Only `src/archive.c` includes libarchive.
+  * libarchive never writes anything: LPM creates every file itself.
+  * It is a BLFS package, so build it on LFS before `make`.
+* **OpenSSL libcrypto** computes SHA-256 through the EVP interface, which is
+  not deprecated in either OpenSSL 1.1 or 3.x.
+  * It is part of base LFS, and the later Ed25519 milestone will use the
+    same library.
+  * libsodium was not chosen because it would be a second crypto
+    dependency.
+  * LPM does not implement SHA-256 itself.
+
+### SHA-256 verification
+
+The chain is checked in this order, and nothing reaches the root unless
+every step holds:
+
+1. **Optional `--sha256 HEX`:** the digest of the whole package file, for
+   example one published next to a download. It is checked on the same open
+   descriptor that libarchive reads next, so the file cannot be swapped in
+   between. A digest you type may be upper or lower case.
+2. **`metadata.txt`** is parsed strictly. Its raw bytes are kept for the
+   future signature check.
+3. **`SHA-256(manifest.txt)`** must equal `manifest_sha256`, and it is
+   checked before the manifest is parsed.
+4. **Each payload file** is streamed through SHA-256 in 64 KiB chunks, so
+   memory use is constant, and must match its manifest line.
+
+Rules for the comparison:
+* Digests are compared in constant time.
+* Inside packages there is exactly one spelling, 64 lowercase hex digits,
+  as in Milestone 2.
+
+Each error is distinct:
+
+| Error | Status code |
+|-------|-------------|
+| missing file | `LPM_ERR_NOT_FOUND` |
+| unreadable file | `LPM_ERR_IO` |
+| hashing failed | `LPM_ERR_CRYPTO` |
+| malformed digest | `LPM_ERR_INVALID` |
+| digests differ | `LPM_ERR_INTEGRITY`; the message shows both digests and the file |
+
+### Safe extraction rules
+
+They apply to `lpm_archive_extract()` and to installation alike.
+
+**Names are rejected, never repaired, when they are:**
+* absolute (`/etc/passwd`);
+* contain a `..` component (`../x`, `usr/../../etc/x`);
+* empty or `.` components, control characters, non-ASCII, or a leading or
+  trailing space in a component.
+
+**Files are never written through a symlink.**
+* Every directory is opened from its parent with
+  `openat(O_NOFOLLOW | O_DIRECTORY)`.
+* A symlink in the archive cannot be used as a directory later, and neither
+  can one already planted in the target root.
+
+**Symlink policy.** A link target must be relative and contain no `..`, so a
+link can only point at or below its own directory. Absolute targets such as
+`/etc` are rejected, and a file, or a symlink, can't be the parent of another
+manifest entry.
+
+**Hard links, devices, FIFOs and sockets** are rejected.
+
+**Modes**
+* Installation: manifest modes above `0755` (setuid, setgid, sticky, group-
+  or world-writable) are rejected.
+* Generic extraction: modes are masked to `0755`.
+* Ownership is never changed: files belong to whoever runs LPM.
+
+**No overwriting.**
+* Installation refuses to replace a file that already exists, whether or not
+  LPM owns it (`linkat` fails instead of replacing).
+* Extraction uses `O_CREAT | O_EXCL`.
+
+**Limits:** 8 GiB of extracted data and 262,144 entries per archive; the
+Milestone 3 path limits still apply.
+
+### `--root` behaviour
+
+* Everything, including the database and the staging area, goes below
+  `--root`. The tests check that nothing appears next to the root or on the
+  host.
+* `lpm install` without `--root`, or with any spelling of `/`, is refused
+  until packages are authenticated.
+
+### How `lpm install` works
+
+Every step below happens while holding the database lock:
+
+1. Open the package file, optionally check `--sha256`, then lock and create
+   the database.
+2. Verify the package as described above. Verified files go into
+   `var/lib/lpm/staging/install.<pid>.<n>/`, never into the root directly.
+3. Pre-flight checks:
+   - the package is not already registered;
+   - no file is owned by another package;
+   - nothing already exists where a file should go;
+   - no path passes through a symlink.
+4. Commit: hard-link each staged, verified file into place, then create the
+   symlinks and directories.
+5. Register the package. The file list is the files and symlinks, and the
+   record keeps `manifest_sha256`.
+6. Remove the staging directory.
+
+If step 4 or 5 fails, every file and directory created in step 4 is removed
+again and the database stays unchanged. Every single injected failure in the
+tests ends in either "fully installed" or "untouched".
+
+### Known limitations
+
+* Integrity is not authenticity: anyone can build a package whose hashes
+  match. Ed25519 signatures over `metadata.txt` come later, and so does
+  installing into `/`.
+* **This is not a full transaction.** A crash (power cut or `kill -9`)
+  during steps 4–5 can leave files without a record.
+  * It is never silent: the staging directory remains, and `lpm check`
+    reports "interrupted installation".
+  * The crash test found such a state at 70 of 149 crash points, and every
+    one was reported.
+  * Removing such leftovers, and `lpm remove` itself, come in a later
+    milestone.
+* Staging and the target must be on the same filesystem, because a hard
+  link can't cross filesystems. Otherwise installation fails with a clear
+  message and rolls back.
+* Files are placed from `/usr`, `/etc` and so on, never through symlinks. On
+  LFS, `/bin`, `/lib` and `/sbin` are symlinks into `/usr`, so packages must
+  use `/usr/bin` and the like.
+* Installing over files that already exist (upgrades) isn't supported.
+
+### Tests
+
+| Program | Tests | Covers |
+|---------|-------|--------|
+| `build/test_integrity` | 13 | NIST vectors ("abc", empty, 448-bit, one million `a`), a 96 MiB streamed file, mismatch, case normalisation, malformed digests, missing / unreadable / FIFO |
+| `build/test_archive` | 23 | normal extraction, gzip/xz, nested and empty directories, corrupt and truncated archives, traversal, absolute paths, four symlink escapes, hard links, devices, overwrite, rollback, descriptor leaks |
+| `build/test_install` | 26 | verify, install, `--sha256`, tampered payload / manifest / symlink, structural errors, attacks, conflicts, real-root refusal, a failure injected at every system call and allocation, a crash at every system call, disk full, cross-filesystem |
+| `tests/run_tests.sh` | 37 new | the same flows through the real `lpm` binary, with packages built by `lpm-mkpkg.sh` and GNU tar |
+
+**Sanitizer hangs on new kernels with old GCC.** On a kernel with
+`vm.mmap_rnd_bits = 32` (e.g. WSL2 6.x), the AddressSanitizer runtime of
+older GCC releases (GCC 9 in Ubuntu 20.04) can hang at random, even in
+`lpm help`. This is a sanitizer bug, not an LPM bug: Milestone 3's code
+hangs the same way.
+
+The workaround turns off address randomisation for the test run only:
+
+    make debug && setarch "$(uname -m)" -R make test
+
+GCC 16 on LFS shouldn't need it.
+
+### Demonstration (never touches the real system)
+
+```sh
+make
+S=$(mktemp -d); R=$(mktemp -d)
+mkdir -p $S/payload/usr/bin $S/payload/etc
+printf '#!/bin/sh\necho "Hello from LPM"\n' > $S/payload/usr/bin/hello
+chmod 755 $S/payload/usr/bin/hello
+echo greeting=hello > $S/payload/etc/hello.conf
+printf 'name=hello\nversion=1.0\ndescription=Demo\n' > $S/metadata.in
+tools/lpm-mkpkg.sh $S /tmp/hello.lpm xz
+
+./lpm verify /tmp/hello.lpm                       # 1. integrity OK
+./lpm --root $R install /tmp/hello.lpm            # 2. installed into $R
+find $R/usr $R/etc; $R/usr/bin/hello; ./lpm --root $R list
+
+T=$(mktemp -d); tar -xJf /tmp/hello.lpm -C $T     # 3. change one file
+echo 'echo pwned' >> $T/payload/usr/bin/hello
+tar -cJf /tmp/bad.lpm -C $T metadata.txt manifest.txt payload
+./lpm --root $(mktemp -d) install /tmp/bad.lpm    #    INTEGRITY FAILURE, nothing installed
+
+E=$(mktemp -d); mkdir -p $E/payload/etc; echo pwned > $E/payload/etc/x   # 4. escape attempt
+printf 'file %s 0644 /etc/x\n' $(sha256sum $E/payload/etc/x | cut -d' ' -f1) > $E/manifest.txt
+printf 'name=evil\nversion=1\nmanifest_sha256=%s\n' $(sha256sum $E/manifest.txt | cut -d' ' -f1) > $E/metadata.txt
+tar -cf /tmp/evil.lpm -C $E metadata.txt manifest.txt \
+    --transform='s,^payload/etc/x$,payload/../../escape.txt,' payload/etc/x
+./lpm --root $R install /tmp/evil.lpm             #    path traversal rejected
+ls $R/../escape.txt $R/../../escape.txt           #    neither exists
+```

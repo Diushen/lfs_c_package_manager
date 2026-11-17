@@ -7,9 +7,11 @@
  */
 #include "commands.h"
 #include "database.h"
+#include "install.h"
 #include "metadata.h"
 #include "util.h"
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +21,8 @@ static lpm_status cmd_version(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_list(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_info(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_not_implemented(const lpm_config *cfg, int argc, char **argv);
 
 static const lpm_command commands[] = {
@@ -27,8 +31,8 @@ static const lpm_command commands[] = {
     { "version", "",             "Show version information",               0, 0, 1, cmd_version },
     { "list",    "",             "List installed packages",                0, 0, 1, cmd_list },
     { "info",    "<package>",    "Show details of an installed package",   1, 1, 1, cmd_info },
-    { "verify",  "<file.pkg>",   "Verify a package's checksum/signature",  1, 1, 0, cmd_not_implemented },
-    { "install", "<file.pkg>",   "Install a local package archive",        1, 1, 0, cmd_not_implemented },
+    { "verify",  "<file.lpm> [--sha256 HEX]", "Verify a package's SHA-256 integrity", 1, 3, 1, cmd_verify },
+    { "install", "<file.lpm> [--sha256 HEX]", "Install a local package (not into / yet)", 1, 3, 1, cmd_install },
     { "remove",  "<package>",    "Remove an installed package",            1, 1, 0, cmd_not_implemented },
     { "check",   "",             "Check database consistency",             0, 0, 1, cmd_check },
 };
@@ -67,10 +71,10 @@ void lpm_print_help(void)
 
     printf("Commands:\n");
     for (i = 0; i < COMMAND_COUNT; i++) {
-        char synopsis[64];
+        char synopsis[80];
         snprintf(synopsis, sizeof(synopsis), "%s %s",
                  commands[i].name, commands[i].usage);
-        printf("  %-22s %s%s\n", synopsis, commands[i].summary,
+        printf("  %-34s %s%s\n", synopsis, commands[i].summary,
                commands[i].implemented ? "" : " (planned)");
     }
 }
@@ -268,6 +272,91 @@ static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv)
     printf("No problems found by the implemented checks.\n");
     printf("Not checked yet: whether owned files exist on disk or match their "
            "checksums (later milestones).\n");
+    return LPM_OK;
+}
+
+/* Parse "<file> [--sha256 HEX]" (argv[0] is the command name). */
+static lpm_status package_args(int argc, char **argv, const char **file,
+                               const char **sha256)
+{
+    *file = argv[1];
+    *sha256 = NULL;
+    if (argc == 2)
+        return LPM_OK;
+    if (argc == 4 && strcmp(argv[2], "--sha256") == 0) {
+        *sha256 = argv[3];
+        return LPM_OK;
+    }
+    lpm_error("usage: %s %s <file.lpm> [--sha256 HEX]", LPM_PROGRAM_NAME, argv[0]);
+    lpm_print_usage_hint();
+    return LPM_ERR_USAGE;
+}
+
+static void report_package_error(const char *what, const char *file,
+                                 lpm_status rc, const lpm_meta_error *err)
+{
+    lpm_error("%s %s: %s%s", what, file,
+              rc == LPM_ERR_INTEGRITY ? "INTEGRITY FAILURE: " : "",
+              err->message[0] ? err->message : lpm_status_str(rc));
+}
+
+static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv)
+{
+    const char *file, *sha256;
+    lpm_pkg_summary s;
+    lpm_meta_error err;
+    lpm_status rc;
+
+    (void)cfg;   /* verification reads only the package file */
+    rc = package_args(argc, argv, &file, &sha256);
+    if (rc != LPM_OK)
+        return rc;
+    rc = lpm_verify_package(file, sha256, &s, &err);
+    if (rc != LPM_OK) {
+        report_package_error("cannot verify", file, rc, &err);
+        return rc;
+    }
+    printf("Package:          %s %s\n", s.name, s.version);
+    printf("Package SHA-256:  %s%s\n", s.archive_sha256,
+           sha256 ? " (matches --sha256)" : "");
+    printf("Manifest:         matches manifest_sha256 in metadata.txt\n");
+    printf("Payload:          %zu file%s, %zu symlink%s, %zu director%s, "
+           "%ju bytes; every SHA-256 matches\n",
+           s.files, s.files == 1 ? "" : "s", s.symlinks, s.symlinks == 1 ? "" : "s",
+           s.dirs, s.dirs == 1 ? "y" : "ies", (uintmax_t)s.bytes);
+    printf("Result:           INTEGRITY OK (not authenticated: signatures are "
+           "checked in a later milestone)\n");
+    return LPM_OK;
+}
+
+static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv)
+{
+    lpm_install_options opt;
+    const char *file, *sha256;
+    lpm_pkg_summary s;
+    lpm_meta_error err;
+    lpm_status rc;
+
+    rc = package_args(argc, argv, &file, &sha256);
+    if (rc != LPM_OK)
+        return rc;
+    opt.expected_sha256 = sha256;
+    opt.allow_real_root = false;   /* never from the CLI until signatures */
+    opt.lock_wait_ms = 5000;
+    rc = lpm_install_package(cfg, file, &opt, &s, &err);
+    if (rc != LPM_OK) {
+        report_package_error("cannot install", file, rc, &err);
+        if (rc == LPM_ERR_INTEGRITY || rc == LPM_ERR_INVALID ||
+            rc == LPM_ERR_CONFLICT || rc == LPM_ERR_EXISTS)
+            fprintf(stderr, "Nothing was installed and the database is unchanged.\n");
+        return rc;
+    }
+    printf("Installed %s %s into '%s': %zu file%s, %zu symlink%s, %zu "
+           "director%s (%ju bytes).\n", s.name, s.version, cfg->root,
+           s.files, s.files == 1 ? "" : "s", s.symlinks, s.symlinks == 1 ? "" : "s",
+           s.dirs, s.dirs == 1 ? "y" : "ies", (uintmax_t)s.bytes);
+    printf("Every file matched its SHA-256 before it was placed. The package "
+           "is not authenticated (no signature check yet).\n");
     return LPM_OK;
 }
 

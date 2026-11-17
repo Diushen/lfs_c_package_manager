@@ -84,6 +84,9 @@ static int tf_summary(void)
 /* Deterministic PRNG (xorshift32) for reproducible fuzzing. */
 static unsigned tf_rng_state = 0x9e3779b9u;
 
+#if defined(__GNUC__)
+__attribute__((unused))
+#endif
 static unsigned tf_rand(void)
 {
     unsigned x = tf_rng_state;

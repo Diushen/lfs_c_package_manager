@@ -164,6 +164,29 @@ lpm_status lpm_db_register_package(lpm_db *db, const lpm_package *pkg,
 lpm_status lpm_db_unregister_package(lpm_db *db, const char *name,
                                      lpm_meta_error *err);
 
+/*
+ * Milestone 4: run every check lpm_db_register_package() would run
+ * (validation, duplicate, file-ownership conflicts) without writing.
+ * The installer calls it before placing any file, then registers under
+ * the same lock, so the answer cannot change in between.
+ */
+lpm_status lpm_db_check_register(lpm_db *db, const lpm_package *pkg,
+                                 const lpm_file_list *files, lpm_meta_error *err);
+
+/*
+ * Milestone 4: a private, empty staging directory for one installation,
+ * var/lib/lpm/staging/install.<pid>.<n> (mode 0700), on the same
+ * filesystem as the database. lpm_db_remove_staging() deletes its flat
+ * file contents and the directory, and closes stage_fd. A directory left
+ * by a crash is reported by lpm_db_check().
+ */
+#define LPM_DB_STAGING_DIR     "staging"
+#define LPM_DB_STAGE_NAME_MAX  64
+lpm_status lpm_db_open_staging(lpm_db *db, int *stage_fd,
+                               char name[LPM_DB_STAGE_NAME_MAX], lpm_meta_error *err);
+lpm_status lpm_db_remove_staging(lpm_db *db, int stage_fd, const char *name,
+                                 lpm_meta_error *err);
+
 /* Read and validate files/<name>.list. NOT_FOUND if there is none. */
 lpm_status lpm_db_read_file_list(lpm_db *db, const char *name,
                                  lpm_file_list *out, lpm_meta_error *err);

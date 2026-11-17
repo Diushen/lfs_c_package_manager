@@ -41,7 +41,9 @@ typedef enum {
     LPM_ERR_NOT_IMPLEMENTED,  /* command planned for a later milestone */
     LPM_ERR_EXISTS,           /* item already exists (e.g. registered) */
     LPM_ERR_BUSY,             /* database locked by another process    */
-    LPM_ERR_CONFLICT          /* file already owned by another package */
+    LPM_ERR_CONFLICT,         /* file already owned by another package */
+    LPM_ERR_INTEGRITY,        /* SHA-256 mismatch: content was altered  */
+    LPM_ERR_CRYPTO            /* the hashing library itself failed      */
 } lpm_status;
 
 /* Runtime configuration built from global command-line options. */
