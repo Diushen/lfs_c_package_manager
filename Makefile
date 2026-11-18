@@ -49,14 +49,18 @@ CORE_OBJ = build/util.o build/metadata.o build/version.o build/filelist.o
 DB_OBJ   = $(CORE_OBJ) build/database.o
 PKG_OBJ  = $(DB_OBJ) build/integrity.o build/safefs.o build/archive.o \
            build/manifest.o build/pkg.o build/install.o build/solver.o \
-           build/plan.o
+           build/plan.o build/signature.o build/trust.o
+SIGN_OBJ = build/signature.o build/integrity.o build/metadata.o build/util.o
 
 # Unit tests live in tests/ (never matched by the src/*.c wildcard, so
 # they cannot end up in the lpm binary).
 TEST_BIN      = build/test_metadata build/test_version build/test_filelist \
                 build/test_database build/test_integrity build/test_archive \
-                build/test_install build/test_solver build/test_deps
+                build/test_install build/test_solver build/test_deps \
+                build/test_signature build/test_auth
 DEMO_BIN      = build/lpm-db-demo
+# Package signing tool (Milestone 6); like the demo, never installed.
+SIGN_BIN      = build/lpm-sign
 # GNU ld --wrap lets a test intercept a function to inject failures:
 # allocation failures everywhere, and system-call failures (short
 # writes, EINTR, ENOSPC, EIO, ...) for the database test.
@@ -66,7 +70,7 @@ SYSCALL_WRAP  = -Wl,--wrap=write -Wl,--wrap=fsync -Wl,--wrap=renameat \
                 -Wl,--wrap=fchmod -Wl,--wrap=close -Wl,--wrap=flock
 INSTALL_WRAP  = $(SYSCALL_WRAP) -Wl,--wrap=linkat -Wl,--wrap=symlinkat
 
-DEP  = $(OBJ:.o=.d) $(TEST_BIN:=.d) build/lpm-db-demo.d
+DEP  = $(OBJ:.o=.d) $(TEST_BIN:=.d) build/lpm-db-demo.d build/lpm-sign.d
 
 .PHONY: all debug test unit-test demo clean install
 
@@ -76,6 +80,9 @@ $(BIN): $(OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(OBJ) $(LPM_LIBS) $(LDLIBS)
 
 build/%.o: src/%.c | build
+	$(CC) $(LPM_CPPFLAGS) $(CPPFLAGS) $(LPM_CFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+build/lpm-sign.o: tools/lpm-sign.c | build
 	$(CC) $(LPM_CPPFLAGS) $(CPPFLAGS) $(LPM_CFLAGS) $(CFLAGS) -MMD -MP -c -o $@ $<
 
 build/test_%.o: tests/test_%.c | build
@@ -113,10 +120,19 @@ build/test_solver: build/test_solver.o build/solver.o build/version.o build/meta
 build/test_deps: build/test_deps.o $(PKG_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(INSTALL_WRAP) -Wl,--wrap=lpm_pkg_read -o $@ $^ $(LPM_LIBS) $(LDLIBS)
 
+build/test_signature: build/test_signature.o $(SIGN_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) -o $@ $^ $(CRYPTO_LIBS) $(LDLIBS)
+
+build/test_auth: build/test_auth.o $(PKG_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) $(ALLOC_WRAP) $(INSTALL_WRAP) -Wl,--wrap=lpm_pkg_read -o $@ $^ $(LPM_LIBS) $(LDLIBS)
+
+$(SIGN_BIN): build/lpm-sign.o $(SIGN_OBJ)
+	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LPM_LIBS) $(LDLIBS)
+
 $(DEMO_BIN): build/lpm-db-demo.o $(DB_OBJ)
 	$(CC) $(LPM_CFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
-demo: $(DEMO_BIN)
+demo: $(DEMO_BIN) $(SIGN_BIN)
 
 build:
 	mkdir -p build
@@ -125,10 +141,10 @@ debug:
 	$(MAKE) clean
 	mkdir -p build
 	printf 'CFLAGS = -O0 -g %s\nLDFLAGS = %s\n' '$(SANITIZE)' '$(SANITIZE)' > build/config.mk
-	$(MAKE) all $(TEST_BIN) $(DEMO_BIN)
+	$(MAKE) all $(TEST_BIN) $(DEMO_BIN) $(SIGN_BIN)
 
-test: $(BIN) $(TEST_BIN) $(DEMO_BIN)
-	bash tests/run_tests.sh ./$(BIN) ./$(DEMO_BIN)
+test: $(BIN) $(TEST_BIN) $(DEMO_BIN) $(SIGN_BIN)
+	bash tests/run_tests.sh ./$(BIN) ./$(DEMO_BIN) ./$(SIGN_BIN)
 	./build/test_metadata tests/fixtures
 	./build/test_version
 	./build/test_filelist
@@ -138,6 +154,8 @@ test: $(BIN) $(TEST_BIN) $(DEMO_BIN)
 	./build/test_install
 	./build/test_solver
 	./build/test_deps
+	./build/test_signature
+	./build/test_auth
 
 unit-test: $(TEST_BIN)
 	./build/test_metadata tests/fixtures
@@ -149,6 +167,8 @@ unit-test: $(TEST_BIN)
 	./build/test_install
 	./build/test_solver
 	./build/test_deps
+	./build/test_signature
+	./build/test_auth
 
 install: $(BIN)
 	install -D -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)

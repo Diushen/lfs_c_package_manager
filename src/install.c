@@ -9,6 +9,7 @@
 #include "pkg.h"
 #include "plan.h"
 #include "safefs.h"
+#include "trust.h"
 #include "util.h"
 
 #include <errno.h>
@@ -120,6 +121,42 @@ lpm_status lpm_verify_package(const char *path, const char *expected_sha256,
     return rc;
 }
 
+lpm_status lpm_verify_authenticated(const lpm_config *cfg, const char *path,
+                                    const char *expected_sha256, lpm_pkg_summary *out,
+                                    lpm_auth_result *auth, bool *integrity_ok,
+                                    lpm_meta_error *err)
+{
+    char digest[LPM_SHA256_HEX_LEN + 1];
+    lpm_pkg pkg;
+    lpm_status rc;
+    int fd, root_fd;
+
+    summary_clear(out);
+    memset(auth, 0, sizeof(*auth));
+    *integrity_ok = false;
+    rc = open_package(path, expected_sha256, &fd, digest, err);
+    if (rc != LPM_OK)
+        return rc;
+    rc = lpm_pkg_read(fd, -1, &pkg, err);   /* integrity: writes nothing */
+    close(fd);
+    if (rc != LPM_OK)
+        return rc;
+    *integrity_ok = true;
+    summary_fill(out, &pkg, digest);
+
+    /* Authenticity against the trust store of the selected root. A root
+     * that cannot be opened simply has no trusted keys. */
+    root_fd = open(cfg->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    rc = lpm_authenticate(root_fd, pkg.metadata_raw, pkg.metadata_len,
+                          pkg.signature_raw, pkg.signature_len, auth, err);
+    if (out != NULL)
+        memcpy(out->signer, auth->key_id, sizeof(out->signer));
+    if (root_fd >= 0)
+        close(root_fd);
+    lpm_pkg_free(&pkg);
+    return rc;
+}
+
 /* ---- Pre-flight and commit ---------------------------------------------- */
 
 /*
@@ -128,6 +165,20 @@ lpm_status lpm_verify_package(const char *path, const char *expected_sha256,
  * or symlink goes; a directory entry may already exist as a directory.
  * Checking first means the common conflicts fail before any write.
  */
+/* LPM's own management areas: the trust store and the database. */
+static bool is_protected(const char *path)
+{
+    static const char *const areas[] = { "/etc/lpm", "/var/lib/lpm" };
+    size_t i;
+
+    for (i = 0; i < sizeof(areas) / sizeof(areas[0]); i++) {
+        size_t n = strlen(areas[i]);
+        if (strncmp(path, areas[i], n) == 0 && (path[n] == '\0' || path[n] == '/'))
+            return true;
+    }
+    return false;
+}
+
 static lpm_status preflight(int root_fd, const lpm_manifest *m, lpm_meta_error *err)
 {
     size_t i;
@@ -139,6 +190,16 @@ static lpm_status preflight(int root_fd, const lpm_manifest *m, lpm_meta_error *
         struct stat st;
         lpm_status rc;
         int dfd;
+
+        /* A package (even a trusted one) may never add keys to the trust
+         * store or touch the database: those are administrative areas. */
+        if (is_protected(e->path)) {
+            lpm_meta_error_set(err, LPM_META_ERR_PROTECTED_PATH, 0, "path",
+                               "%.200s is inside LPM's protected area (/etc/lpm, "
+                               "/var/lib/lpm); packages may not install there",
+                               e->path);
+            return LPM_ERR_INVALID;
+        }
 
         rc = lpm_safe_split(e->path + 1, parent, sizeof(parent), &base, err);
         if (rc != LPM_OK)
@@ -270,6 +331,7 @@ typedef struct {
     lpm_pkg pkg;                   /* fully verified contents              */
     lpm_file_list files;           /* what it will own                     */
     lpm_path_log log;              /* what committing it created           */
+    lpm_auth_result auth;          /* signature and trust result (M6)     */
     bool registered;
 } prepared;
 
@@ -327,6 +389,12 @@ static lpm_status prepare(lpm_db *db, prepared *p, const char *expected,
         rc = lpm_db_open_staging(db, &p->stage_fd, p->stage_name, err);
     if (rc == LPM_OK)
         rc = lpm_pkg_read(p->fd, p->stage_fd, &p->pkg, err);
+    /* Milestone 6: the metadata bytes just read from this descriptor
+     * must carry a valid signature by a trusted key. Only then is the
+     * metadata (and, through manifest_sha256, everything) authentic. */
+    if (rc == LPM_OK)
+        rc = lpm_authenticate(db->root_fd, p->pkg.metadata_raw, p->pkg.metadata_len,
+                              p->pkg.signature_raw, p->pkg.signature_len, &p->auth, err);
     if (rc == LPM_OK && !lpm_package_equal(&p->pkg.meta, p->node->pkg)) {
         lpm_meta_error_set(err, LPM_META_ERR_STATE, 0, NULL,
                            "package file changed after the dependency plan was made");
@@ -517,8 +585,11 @@ lpm_status lpm_install_packages(const lpm_config *cfg, const char *path,
             undo_package(&db, &pkgs[k]);
         goto out;
     }
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
         summary_fill(&report->items[i], &pkgs[i].pkg, pkgs[i].digest);
+        memcpy(report->items[i].signer, pkgs[i].auth.key_id,
+               sizeof(report->items[i].signer));
+    }
     report->count = n;
     report->satisfied = res.plan.satisfied;
 

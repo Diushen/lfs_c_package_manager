@@ -13,12 +13,14 @@
  *   metadata.txt --manifest_sha256--> manifest.txt --sha256 per file--> payload
  *
  * Every payload byte is therefore covered by a hash that metadata.txt
- * commits to. A later milestone adds an Ed25519 signature over the raw
- * bytes of metadata.txt (kept in lpm_pkg.metadata_raw for exactly that
- * purpose), which completes the chain back to a trusted key.
+ * commits to. Milestone 6 adds an optional third entry, signature.txt:
+ * an Ed25519 signature over the raw bytes of metadata.txt (kept in
+ * lpm_pkg.metadata_raw for exactly that purpose), which completes the
+ * chain back to a trusted key. This module only reads the record;
+ * trust.c decides whether it is valid and trusted.
  *
- * Integrity is NOT authenticity: until signatures are checked, anyone
- * can build a package whose hashes all match.
+ * Integrity is NOT authenticity: lpm_pkg_read() alone proves only that
+ * the hashes agree; anyone can build such a package.
  */
 #ifndef LPM_PKG_H
 #define LPM_PKG_H
@@ -33,11 +35,15 @@
 #define LPM_PKG_METADATA  "metadata.txt"
 #define LPM_PKG_MANIFEST  "manifest.txt"
 #define LPM_PKG_PAYLOAD   "payload"
+#define LPM_PKG_SIGNATURE "signature.txt"   /* Milestone 6, optional */
+#define LPM_PKG_SIGNATURE_MAX 1024
 
 typedef struct {
     lpm_package meta;          /* parsed metadata.txt                     */
-    char *metadata_raw;        /* its exact bytes (for the future verifier) */
+    char *metadata_raw;        /* its exact bytes (what the signature covers) */
     size_t metadata_len;
+    char *signature_raw;       /* signature.txt bytes, NULL if unsigned */
+    size_t signature_len;
     lpm_manifest manifest;     /* parsed, hash-verified manifest.txt      */
     uint64_t payload_bytes;    /* bytes of regular-file content verified  */
 } lpm_pkg;

@@ -9,13 +9,18 @@
 #include "database.h"
 #include "install.h"
 #include "plan.h"
+#include "signature.h"
+#include "trust.h"
 #include "metadata.h"
 #include "util.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static lpm_status cmd_help(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_version(const lpm_config *cfg, int argc, char **argv);
@@ -25,6 +30,7 @@ static lpm_status cmd_check(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_plan(const lpm_config *cfg, int argc, char **argv);
+static lpm_status cmd_key(const lpm_config *cfg, int argc, char **argv);
 static lpm_status cmd_not_implemented(const lpm_config *cfg, int argc, char **argv);
 
 static const lpm_command commands[] = {
@@ -38,6 +44,7 @@ static const lpm_command commands[] = {
     { "install", "<file.lpm> [--sha256 HEX]", "Install a local package (not into / yet)", 1, 5, 1, cmd_install },
     { "remove",  "<package>",    "Remove an installed package",            1, 1, 0, cmd_not_implemented },
     { "check",   "",             "Check database consistency",             0, 0, 1, cmd_check },
+    { "key",     "list | add FILE.pem | remove KEY_ID", "Manage trusted signing keys", 1, 2, 1, cmd_key },
 };
 
 #define COMMAND_COUNT (sizeof(commands) / sizeof(commands[0]))
@@ -318,38 +325,153 @@ static void report_package_error(const char *what, const char *file,
                                  lpm_status rc, const lpm_meta_error *err)
 {
     lpm_error("%s %s: %s%s", what, file,
-              rc == LPM_ERR_INTEGRITY ? "INTEGRITY FAILURE: " : "",
+              rc == LPM_ERR_INTEGRITY ? "INTEGRITY FAILURE: " :
+              (rc == LPM_ERR_SIGNATURE || rc == LPM_ERR_UNTRUSTED) ? "AUTHENTICATION FAILURE: " : "",
               err->message[0] ? err->message : lpm_status_str(rc));
 }
 
+/*
+ * Integrity and authenticity are reported separately. Exit status:
+ *   0  intact AND signed by a key trusted under --root (installable)
+ *   1  integrity failure, or a malformed / invalid signature (tampered)
+ *   3  intact but not authenticated: unsigned, or signer not trusted
+ */
 static lpm_status cmd_verify(const lpm_config *cfg, int argc, char **argv)
 {
     const char *file, *sha256, *unused;
     lpm_pkg_summary s;
+    lpm_auth_result a;
     lpm_meta_error err;
     lpm_status rc;
+    bool intact;
 
-    (void)cfg;   /* verification reads only the package file */
     rc = package_args(argc, argv, OPT_SHA256, "<file.lpm> [--sha256 HEX]",
                       &file, &sha256, &unused);
     if (rc != LPM_OK)
         return rc;
-    rc = lpm_verify_package(file, sha256, &s, &err);
-    if (rc != LPM_OK) {
+    rc = lpm_verify_authenticated(cfg, file, sha256, &s, &a, &intact, &err);
+    if (!intact) {
         report_package_error("cannot verify", file, rc, &err);
         return rc;
     }
     printf("Package:          %s %s\n", s.name, s.version);
     printf("Package SHA-256:  %s%s\n", s.archive_sha256,
            sha256 ? " (matches --sha256)" : "");
-    printf("Manifest:         matches manifest_sha256 in metadata.txt\n");
-    printf("Payload:          %zu file%s, %zu symlink%s, %zu director%s, "
+    printf("Integrity:\n");
+    printf("  Manifest:       matches manifest_sha256 in metadata.txt\n");
+    printf("  Payload:        %zu file%s, %zu symlink%s, %zu director%s, "
            "%ju bytes; every SHA-256 matches\n",
            s.files, s.files == 1 ? "" : "s", s.symlinks, s.symlinks == 1 ? "" : "s",
            s.dirs, s.dirs == 1 ? "y" : "ies", (uintmax_t)s.bytes);
-    printf("Result:           INTEGRITY OK (not authenticated: signatures are "
-           "checked in a later milestone)\n");
-    return LPM_OK;
+    printf("Authentication (trust store: %s/%s):\n",
+           strcmp(cfg->root, "/") == 0 ? "" : cfg->root, LPM_TRUST_DIR);
+    if (a.status == LPM_AUTH_UNSIGNED || a.status == LPM_AUTH_BAD_RECORD) {
+        printf("  Signature:      %s\n", a.status == LPM_AUTH_UNSIGNED ? "none (unsigned)"
+                                                                    : "MALFORMED");
+    } else {
+        printf("  Signature:      Ed25519, %s\n", a.signature_valid ? "valid" : "INVALID");
+        printf("  Signing key:    %s\n", a.key_id);
+        printf("  Trust:          %s\n", !a.signature_valid ? "not checked (signature invalid)"
+                                         : a.key_trusted ? "trusted" : "NOT trusted");
+    }
+
+    if (rc == LPM_OK) {
+        printf("Result:           INTEGRITY OK, AUTHENTICATED: signed by a trusted key "
+               "(this proves origin, not that the contents are harmless)\n");
+        return LPM_OK;
+    }
+    if (rc == LPM_ERR_SIGNATURE && a.status != LPM_AUTH_UNSIGNED) {
+        printf("Result:           REJECTED: %s\n", err.message);
+        report_package_error("cannot verify", file, rc, &err);
+        return rc;                                   /* exit 1 */
+    }
+    printf("Result:           INTEGRITY OK, NOT AUTHENTICATED: %s; installation "
+           "would be refused\n", err.message);
+    return LPM_ERR_UNTRUSTED;                        /* exit 3 */
+}
+
+/* lpm key list | add FILE.pem | remove KEY_ID  (trust store under --root) */
+static lpm_status cmd_key(const lpm_config *cfg, int argc, char **argv)
+{
+    const char *sub = argv[1];
+    lpm_meta_error err;
+    lpm_status rc;
+    lpm_db db;
+
+    if (strcmp(sub, "list") == 0 && argc == 2) {
+        lpm_pubkey *keys;
+        size_t n, i;
+        int root_fd = open(cfg->root, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+        if (root_fd < 0) {
+            lpm_error("cannot open root '%s': %s", cfg->root, strerror(errno));
+            return LPM_ERR_IO;
+        }
+        rc = lpm_trust_list(root_fd, &keys, &n, &err);
+        close(root_fd);
+        if (rc != LPM_OK) {
+            lpm_error("cannot read the trust store: %s", err.message);
+            return rc;
+        }
+        if (n == 0)
+            printf("No trusted keys (packages cannot be installed into '%s').\n",
+                   cfg->root);
+        else
+            printf("Trusted keys (%zu):\n", n);
+        for (i = 0; i < n; i++)
+            printf("  %s  ed25519\n", keys[i].id);
+        free(keys);
+        return LPM_OK;
+    }
+    if (strcmp(sub, "add") != 0 && strcmp(sub, "remove") != 0) {
+        lpm_error("usage: %s key list | key add FILE.pem | key remove KEY_ID",
+                  LPM_PROGRAM_NAME);
+        lpm_print_usage_hint();
+        return LPM_ERR_USAGE;
+    }
+    if (argc != 3) {
+        lpm_error("usage: %s key %s %s", LPM_PROGRAM_NAME, sub,
+                  sub[0] == 'a' ? "FILE.pem" : "KEY_ID");
+        return LPM_ERR_USAGE;
+    }
+
+    /* Changes to the trust store are serialised with installations by
+     * the database's exclusive lock. */
+    rc = lpm_db_open(cfg, LPM_DB_CREATE, 5000, &db, &err);
+    if (rc != LPM_OK) {
+        lpm_error("cannot lock the package database: %s", err.message);
+        return rc;
+    }
+    if (sub[0] == 'a') {
+        lpm_pubkey key;
+        char *pem = NULL;
+        size_t len;
+
+        rc = lpm_read_bounded_fileat(AT_FDCWD, argv[2], LPM_KEY_PEM_MAX, &pem, &len, &err);
+        if (rc == LPM_OK)
+            rc = lpm_pubkey_from_pem(pem, len, &key, &err);
+        free(pem);
+        if (rc == LPM_OK)
+            rc = lpm_trust_add(db.root_fd, &key, &err);
+        if (rc == LPM_OK) {
+            printf("Trusted key added: %s (ed25519)\n", key.id);
+            printf("Stored as %s/%s%s in '%s'.\n", LPM_TRUST_DIR, key.id,
+                   LPM_TRUST_SUFFIX, cfg->root);
+            printf("Packages signed by this key can now be installed into this "
+                   "root. Only trust keys whose owner you trust.\n");
+        } else {
+            lpm_error("cannot add key from %s: %s", argv[2], err.message);
+        }
+    } else {
+        rc = lpm_trust_remove(db.root_fd, argv[2], &err);
+        if (rc == LPM_OK)
+            printf("Removed trusted key %s. Packages signed by it will no longer "
+                   "install. Already installed packages are not changed.\n", argv[2]);
+        else
+            lpm_error("cannot remove key: %s", err.message);
+    }
+    lpm_db_close(&db);
+    return rc;
 }
 
 static const char *node_role(const lpm_plan_node *n)
@@ -456,15 +578,19 @@ static lpm_status cmd_install(const lpm_config *cfg, int argc, char **argv)
            rep.satisfied, rep.count - 1);
     for (i = 0; i < rep.count; i++) {
         const lpm_pkg_summary *s = &rep.items[i];
+        printf("Authenticated %s %s: Ed25519 signature by trusted key %.16s...\n",
+               s->name, s->version, s->signer);
+    }
+    for (i = 0; i < rep.count; i++) {
+        const lpm_pkg_summary *s = &rep.items[i];
         printf("Installed %s %s into '%s': %zu file%s, %zu symlink%s, %zu "
                "director%s (%ju bytes).\n", s->name, s->version, cfg->root,
                s->files, s->files == 1 ? "" : "s", s->symlinks,
                s->symlinks == 1 ? "" : "s", s->dirs, s->dirs == 1 ? "y" : "ies",
                (uintmax_t)s->bytes);
     }
-    printf("Every file matched its SHA-256 before it was placed. The package%s "
-           "%s not authenticated (no signature check yet).\n",
-           rep.count == 1 ? "" : "s", rep.count == 1 ? "is" : "are");
+    printf("Every package was signed by a trusted key and every file matched its "
+           "SHA-256 before anything was placed.\n");
     lpm_install_report_free(&rep);
     return LPM_OK;
 }

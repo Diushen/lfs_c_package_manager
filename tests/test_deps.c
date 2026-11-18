@@ -31,6 +31,10 @@
 #include <archive_entry.h>
 
 #include "test_framework.h"
+#include "test_signing.h"
+
+/* Key used by make_pkg_full(); fresh() resets it to the trusted key. */
+static const lpm_privkey *sign_key;
 
 /* ==================================================================== */
 /* Fault injection (as in test_install.c)                                */
@@ -245,6 +249,15 @@ static void make_pkg_full(const char *file, const char *name, const char *versio
     archive_write_open_filename(a, path);
     add_raw(a, "metadata.txt", 'f', raw_metadata ? raw_metadata : metadata);
     add_raw(a, "manifest.txt", 'f', manifest);
+    /* Milestone 6: signed with sign_key (the trusted test key unless a
+     * test chose another key, or NULL for an unsigned package). */
+    if (sign_key != NULL) {
+        const char *m = raw_metadata ? raw_metadata : metadata;
+        char sig[LPM_SIG_RECORD_MAX + 1];
+        size_t slen = tk_sign(sign_key, m, strlen(m), sig);
+        sig[slen] = '\0';
+        add_raw(a, "signature.txt", 'f', sig);
+    }
     add_raw(a, "payload/", 'd', NULL);
     if (files)
         snprintf(flist, sizeof(flist), "%s", files);
@@ -325,6 +338,20 @@ static void fresh(void)
     mkdir(pkgs, 0755);
     mkdir(outside, 0755);
     cfg.root = root;
+    /* Milestone 6: packages are signed by, and roots trust, the test key. */
+    sign_key = tk_key;
+    if (tk_trust(root, &tk_pub) != 0) {
+        fprintf(stderr, "cannot trust the test key\n");
+        exit(1);
+    }
+}
+
+/* <root>/var: exists once anything (the database) was created. */
+static const char *root_var(void)
+{
+    static char p[800];
+    snprintf(p, sizeof(p), "%s/var", root);
+    return p;
 }
 
 static int count_entries(const char *dir)
@@ -455,7 +482,8 @@ static void test_scenario_a_dag(void)
     for (i = 0; i < r.plan.order_count; i++)
         CHECK(strstr(r.plan.nodes[r.plan.order[i]].source, pkgs) != NULL);
     lpm_resolution_free(&r);
-    CHECK(count_entries(root) == 0);              /* planning wrote nothing */
+    /* planning wrote nothing (the root holds only the M6 trust store) */
+    CHECK(count_entries(root) == 1 && access(root_var(), F_OK) != 0);
 
     CHECK(install_with(pkg_path("app", "1.0"), pkgs, &err) == LPM_OK);
     CHECK(registered("libc") && registered("liba") && registered("libb") && registered("app"));
@@ -708,7 +736,7 @@ static void test_expected_hash_applies_to_request(void)
     opt.expected_sha256 = "0000000000000000000000000000000000000000000000000000000000000000";
     CHECK(lpm_install_packages(&cfg, pkg_path("app", "1.0"), pkgs, &opt, &rep, &err) ==
           LPM_ERR_INTEGRITY);
-    CHECK(count_entries(root) == 0);              /* refused before anything */
+    CHECK(access(root_var(), F_OK) != 0);         /* refused before anything */
     opt.expected_sha256 = digest;
     CHECK(lpm_install_packages(&cfg, pkg_path("app", "1.0"), pkgs, &opt, &rep, &err) ==
           LPM_OK);
@@ -865,6 +893,7 @@ int main(int argc, char **argv)
     fault_reset();
     umask(022);
 
+    tk_init();   /* Milestone 6: ephemeral signing keys */
     printf("Running dependency planning and multi-install tests\n");
     RUN(test_scenario_a_dag);
     RUN(test_scenario_b_missing);
@@ -882,6 +911,7 @@ int main(int argc, char **argv)
     RUN(test_real_root_still_refused);
     RUN(test_fault_injection_all_or_nothing);
     RUN(test_crash_during_multi_install);
+    tk_done();
     if (base[0])
         rm_tree(base);
     return tf_summary();

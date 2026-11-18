@@ -125,7 +125,16 @@ typedef enum {
     LPM_META_ERR_DEP_CYCLE,        /* circular dependency                */
     LPM_META_ERR_DEP_DUPLICATE,    /* two candidates, same name+version  */
     LPM_META_ERR_DEP_LIMIT,        /* graph / search size limit reached  */
-    LPM_META_ERR_DEP_ALREADY       /* requested package already installed */
+    LPM_META_ERR_DEP_ALREADY,      /* requested package already installed */
+    /* Added in Milestone 6 (Ed25519 signatures and trusted keys). */
+    LPM_META_ERR_SIG_MISSING,      /* package has no signature.txt       */
+    LPM_META_ERR_SIG_UNSUPPORTED,  /* unknown signature format/algorithm */
+    LPM_META_ERR_SIG_MALFORMED,    /* signature record cannot be parsed  */
+    LPM_META_ERR_SIG_INVALID,      /* signature does not verify          */
+    LPM_META_ERR_KEY_MALFORMED,    /* not a usable Ed25519 public key    */
+    LPM_META_ERR_KEY_UNTRUSTED,    /* signer not in the trust store      */
+    LPM_META_ERR_KEY_MISMATCH,     /* key id / key / stored key disagree */
+    LPM_META_ERR_PROTECTED_PATH    /* package path in LPM's own areas    */
 } lpm_meta_error_code;
 
 /*

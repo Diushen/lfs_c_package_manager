@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include "lpm.h"
 #include "metadata.h"
+#include "trust.h"
 
 typedef struct {
     const char *expected_sha256;  /* whole package file; NULL = not given  */
@@ -43,6 +44,7 @@ typedef struct {
     char name[LPM_MAX_NAME_LEN + 1];
     char version[LPM_META_MAX_VERSION_LEN + 1];
     char archive_sha256[LPM_SHA256_HEX_LEN + 1];  /* of the package file */
+    char signer[LPM_SHA256_HEX_LEN + 1];          /* key ID; "" if not checked */
     size_t files, symlinks, dirs;
     uint64_t bytes;
 } lpm_pkg_summary;
@@ -56,6 +58,18 @@ typedef struct {
  */
 lpm_status lpm_verify_package(const char *path, const char *expected_sha256,
                               lpm_pkg_summary *out, lpm_meta_error *err);
+
+/*
+ * Milestone 6: integrity (as lpm_verify_package) AND authenticity against
+ * the trust store of cfg->root. *integrity_ok says whether the hash
+ * chain held; *auth reports signature validity and trust separately.
+ * Returns LPM_OK only for an intact package signed by a trusted key;
+ * otherwise the integrity error, or LPM_ERR_SIGNATURE / LPM_ERR_UNTRUSTED.
+ */
+lpm_status lpm_verify_authenticated(const lpm_config *cfg, const char *path,
+                                    const char *expected_sha256, lpm_pkg_summary *out,
+                                    lpm_auth_result *auth, bool *integrity_ok,
+                                    lpm_meta_error *err);
 
 /*
  * Install one package whose dependencies must already be installed.

@@ -35,6 +35,7 @@
 #include <archive_entry.h>
 
 #include "test_framework.h"
+#include "test_signing.h"
 
 /* ==================================================================== */
 /* Fault injection (same model as test_database.c)                       */
@@ -181,9 +182,10 @@ typedef struct {
     int duplicate_first;         /* store the first file entry twice   */
     int manifest_first;          /* swap metadata.txt / manifest.txt   */
     int filter;                  /* 0 none, 1 gzip, 2 xz               */
+    int unsigned_pkg;            /* Milestone 6: leave out signature.txt */
 } damage;
 
-static const damage INTACT = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 2 };
+static const damage INTACT = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 2, 0 };
 
 static char base[512], root[600], outside[600], pkgfile[600];
 static lpm_config cfg;
@@ -272,6 +274,14 @@ static void build_pkg(const char *meta, const pentry *p, size_t n, const damage 
         add_raw(a, "metadata.txt", 'f', metadata, 0644);
         add_raw(a, "manifest.txt", 'f', mtext, 0644);
     }
+    /* Milestone 6: signed by the trusted test key unless a test asks for
+     * an unsigned package. */
+    if (!d->unsigned_pkg) {
+        char sig[LPM_SIG_RECORD_MAX + 1];
+        size_t slen = tk_sign(tk_key, metadata, strlen(metadata), sig);
+        sig[slen] = '\0';
+        add_raw(a, "signature.txt", 'f', sig, 0644);
+    }
     add_raw(a, "payload/", 'd', NULL, 0755);
     for (i = 0; i < n; i++) {
         char name[1200];
@@ -355,6 +365,11 @@ static void fresh(void)
     mkdir(root, 0755);
     mkdir(outside, 0755);
     cfg.root = root;
+    /* Milestone 6: every test root trusts the test publisher's key. */
+    if (tk_trust(root, &tk_pub) != 0) {
+        fprintf(stderr, "cannot trust the test key\n");
+        exit(1);
+    }
 }
 
 static int count_entries(const char *dir)
@@ -420,12 +435,17 @@ static int staging_entries(void)
     return count_entries(p);
 }
 
-/* The root holds nothing but the (possibly created) database. */
+/* The root holds nothing but the (possibly created) database and, since
+ * Milestone 6, the trust store etc/lpm that fresh() created. */
 static int root_untouched(void)
 {
+    char etc[700];
     int n = count_entries(root);
-    return n == 0 || (n == 1 && exists_in(root, "var") && count_entries(outside) == 0 &&
-                      !exists_in(root, "usr") && !exists_in(root, "etc"));
+
+    snprintf(etc, sizeof(etc), "%s/etc", root);
+    return n <= 2 && !exists_in(root, "usr") && count_entries(etc) == 1 &&
+           exists_in(root, "etc/lpm") && count_entries(outside) == 0 &&
+           (n == 1 || exists_in(root, "var"));
 }
 
 /* Fully installed: record plus every payload object, exact content. */
@@ -504,7 +524,8 @@ static void test_verify_good_package(void)
     CHECK(s.files == 3 && s.symlinks == 1 && s.dirs == 1);
     CHECK(s.bytes == strlen(HELLO[0].data) + strlen(HELLO[2].data) + strlen(HELLO[3].data));
     CHECK(strlen(s.archive_sha256) == 64);
-    CHECK(count_entries(root) == 0);              /* verify writes nothing */
+    /* verify writes nothing (the root holds only the M6 trust store) */
+    CHECK(count_entries(root) == 1 && !exists_in(root, "var"));
     CHECK(count_entries(base) == 3);
 }
 
@@ -622,7 +643,7 @@ static void test_expected_package_hash(void)
     /* Wrong digest: rejected before the archive is even opened. */
     REJECTED(install("0000000000000000000000000000000000000000000000000000000000000000", &err),
              LPM_ERR_INTEGRITY, LPM_META_ERR_HASH_MISMATCH);
-    CHECK(count_entries(root) == 0);               /* not even a database */
+    CHECK(!exists_in(root, "var"));                /* not even a database */
     /* Malformed digest: a usage error, not a mismatch. */
     REJECTED(install("abc", &err), LPM_ERR_INVALID, LPM_META_ERR_INVALID_VALUE);
     /* Upper case is accepted for typed digests. */
@@ -876,7 +897,7 @@ static void test_preexisting_symlink_in_root(void)
     CHECK(err.code == LPM_META_ERR_UNSAFE_ENTRY);
     CHECK(count_entries(outside) == 0);       /* nothing went through it */
     CHECK(!registered("hello") && staging_entries() == 0);
-    CHECK(!exists_in(root, "etc"));           /* nothing partial either */
+    CHECK(!exists_in(root, "etc/hello.conf")); /* nothing partial either */
 
     /* Same attack when the package lists /usr itself as a directory. */
     {
@@ -980,7 +1001,7 @@ static void test_missing_package_file(void)
           LPM_ERR_NOT_FOUND);
     CHECK(lpm_verify_package("/nonexistent/pkg.lpm", NULL, NULL, &err) == LPM_ERR_NOT_FOUND);
     CHECK(lpm_verify_package(root, NULL, NULL, &err) == LPM_ERR_INVALID);   /* a dir */
-    CHECK(count_entries(root) == 0);
+    CHECK(!exists_in(root, "var") && !exists_in(root, "usr"));   /* nothing written */
 }
 
 /* ==================================================================== */
@@ -1147,6 +1168,7 @@ int main(int argc, char **argv)
     fault_reset();
     umask(022);
 
+    tk_init();   /* Milestone 6: ephemeral signing keys */
     printf("Running package install unit tests\n");
     RUN(test_verify_good_package);
     RUN(test_install_success);
@@ -1174,6 +1196,7 @@ int main(int argc, char **argv)
     RUN(test_crash_during_install);
     RUN(test_disk_full_while_staging);
     RUN(test_cross_filesystem_failure_rolls_back);
+    tk_done();
     if (base[0])
         rm_tree(base);
     return tf_summary();

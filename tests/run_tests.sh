@@ -1,5 +1,5 @@
 #!/bin/bash
-# CLI tests (Milestones 1-5). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo]
+# CLI tests (Milestones 1-6). Usage: tests/run_tests.sh ./lpm [build/lpm-db-demo] [build/lpm-sign]
 #
 # Every test runs against a throwaway --root directory, never against /.
 
@@ -233,6 +233,19 @@ P4="$WORK/m4"
 mkdir -p "$P4"
 sha_of() { sha256sum "$1" | cut -d' ' -f1; }
 
+# Milestone 6: installation requires a signature by a trusted key, so the
+# Milestone 4/5 fixtures below are signed with a throw-away key (made
+# fresh by OpenSSL for this run, never stored) and each test root that
+# installs trusts it. The assertions themselves are unchanged.
+SIGN="${3:-./build/lpm-sign}"
+KEYS="$WORK/keys"
+mkdir -p "$KEYS"
+openssl genpkey -algorithm ED25519 -out "$KEYS/priv.pem" 2>/dev/null
+chmod 600 "$KEYS/priv.pem"
+openssl pkey -in "$KEYS/priv.pem" -pubout -out "$KEYS/pub.pem" 2>/dev/null
+sign_in_place() { "$SIGN" "$KEYS/priv.pem" "$1" "$1.signed" >/dev/null && mv "$1.signed" "$1"; }
+trust() { "$LPM" --root "$1" key add "$KEYS/pub.pem" >/dev/null; }
+
 # A package source tree: binary, symlink, config, doc, empty directory.
 SRC="$P4/hello-src"
 mkdir -p "$SRC/payload/usr/bin" "$SRC/payload/etc" \
@@ -249,17 +262,21 @@ if bash "$MKPKG" "$SRC" "$P4/hello.lpm" xz >"$WORK/out" 2>"$WORK/err"; then CODE
 check "mkpkg: builds an xz package" 0 out "Built"
 bash "$MKPKG" "$SRC" "$P4/hello.tar.gz.lpm" gz >/dev/null 2>&1
 bash "$MKPKG" "$SRC" "$P4/hello.tar.lpm" none >/dev/null 2>&1
+for f in "$P4/hello.lpm" "$P4/hello.tar.gz.lpm" "$P4/hello.tar.lpm"; do sign_in_place "$f"; done
+K4="$P4/trust-root"; mkdir "$K4"; trust "$K4"   # a root whose store trusts the key
 HSHA=$(sha_of "$P4/hello.lpm")
 HSHA_UP=$(echo "$HSHA" | tr a-f A-F)
 ZERO=0000000000000000000000000000000000000000000000000000000000000000
 
-run verify "$P4/hello.lpm";                 check "verify: good package"               0 out "INTEGRITY OK"
-run verify "$P4/hello.lpm";                 check "verify: counts payload"             0 out "4 files, 1 symlink"
-run verify "$P4/hello.lpm";                 check "verify: prints package SHA-256"     0 out "Package SHA-256:  $HSHA"
-run verify "$P4/hello.tar.gz.lpm";          check "verify: gzip package"               0 out "INTEGRITY OK"
-run verify "$P4/hello.tar.lpm";             check "verify: uncompressed package"       0 out "INTEGRITY OK"
-run verify "$P4/hello.lpm" --sha256 "$HSHA";    check "verify: correct --sha256"       0 out "matches --sha256"
-run verify "$P4/hello.lpm" --sha256 "$HSHA_UP"; check "verify: uppercase --sha256"     0 out "matches --sha256"
+# Milestone 6 (approved): exit 0 now means "installable", so these checks
+# verify against the trust store of $K4.
+run --root "$K4" verify "$P4/hello.lpm";    check "verify: good package"               0 out "INTEGRITY OK"
+run --root "$K4" verify "$P4/hello.lpm";    check "verify: counts payload"             0 out "4 files, 1 symlink"
+run --root "$K4" verify "$P4/hello.lpm";    check "verify: prints package SHA-256"     0 out "Package SHA-256:  $HSHA"
+run --root "$K4" verify "$P4/hello.tar.gz.lpm"; check "verify: gzip package"           0 out "INTEGRITY OK"
+run --root "$K4" verify "$P4/hello.tar.lpm";    check "verify: uncompressed package"   0 out "INTEGRITY OK"
+run --root "$K4" verify "$P4/hello.lpm" --sha256 "$HSHA";    check "verify: correct --sha256"   0 out "matches --sha256"
+run --root "$K4" verify "$P4/hello.lpm" --sha256 "$HSHA_UP"; check "verify: uppercase --sha256" 0 out "matches --sha256"
 run verify "$P4/hello.lpm" --sha256 "$ZERO";    check "verify: wrong --sha256"         1 err "INTEGRITY FAILURE: package file SHA-256 mismatch"
 run verify "$P4/hello.lpm" --sha256 abc;        check "verify: malformed --sha256"     1 err "exactly 64 hexadecimal digits"
 run verify "$P4/hello.lpm" --bogus x;           check "verify: bad option"             2 err "usage"
@@ -267,6 +284,7 @@ run verify "$P4/missing.lpm";               check "verify: missing file"        
 
 R4="$P4/root"
 mkdir "$R4"
+trust "$R4"
 run --root "$R4" install "$P4/hello.lpm" --sha256 "$HSHA"
                                             check "install: succeeds"                  0 out "Installed hello 1.2.0"
 if [ -x "$R4/usr/bin/hello" ] && [ "$("$R4/usr/bin/hello")" = "Hello from LPM" ] &&
@@ -320,14 +338,14 @@ printf 'name=evil\nversion=1\n' > "$SL/metadata.in"
 bash "$MKPKG" "$SL" "$P4/symlink.lpm" none >/dev/null 2>&1
 R8="$P4/root-symlink"; mkdir "$R8"
 run --root "$R8" install "$P4/symlink.lpm"; check "install: absolute symlink rejected"  1 err "symlink target must be relative"
-R9="$P4/root-planted"; mkdir -p "$R9" "$P4/elsewhere"
+R9="$P4/root-planted"; mkdir -p "$R9" "$P4/elsewhere"; trust "$R9"
 ln -s "$P4/elsewhere" "$R9/usr"             # planted before installing
 run --root "$R9" install "$P4/hello.lpm";   check "install: planted symlink refused"    1 err "symbolic link or not a directory"
 if [ -z "$(ls -A "$P4/elsewhere")" ]; then ok "install: nothing written through planted symlink"
 else bad "install: nothing written through planted symlink"; fi
 
 # Existing unowned file is never overwritten.
-R10="$P4/root-existing"; mkdir -p "$R10/etc"
+R10="$P4/root-existing"; mkdir -p "$R10/etc"; trust "$R10"
 printf 'hand-made\n' > "$R10/etc/hello.conf"
 run --root "$R10" install "$P4/hello.lpm";  check "install: existing file conflict"     1 err "already exists in the target root"
 if [ "$(cat "$R10/etc/hello.conf")" = "hand-made" ] && [ ! -e "$R10/usr" ]
@@ -360,6 +378,7 @@ mkdep() {
     printf 'name=%s\nversion=%s\n' "$name" "$ver" > "$s/metadata.in"
     for d in "$@"; do printf 'depends=%s\n' "$d" >> "$s/metadata.in"; done
     bash "$MKPKG" "$s" "${OUTDIR:-$D5}/$name-$ver.lpm" gz >/dev/null
+    sign_in_place "${OUTDIR:-$D5}/$name-$ver.lpm"
     rm -rf "$s"
 }
 mkdep libc 1.0
@@ -379,6 +398,7 @@ run --root "$R11" plan "$D5/app-1.0.lpm" --package-dir "$D5"
 if [ "$(grep -c "libc 1.0  \[" "$WORK/out")" = 1 ]; then ok "plan: libc listed once"; else bad "plan: libc listed once"; fi
 if [ -z "$(ls -A "$R11")" ]; then ok "plan: wrote nothing"; else bad "plan: wrote nothing"; fi
 
+trust "$R11"   # after the "plan wrote nothing" check above
 run --root "$R11" install "$D5/app-1.0.lpm"
                                     check "install: missing deps rejected"     1 err "missing dependency: liba >= 1.0 (required by app 1.0)"
                                     check "install: says rejected"             1 err "Installation rejected"
@@ -394,7 +414,7 @@ run --root "$R11" plan "$D5/app-1.0.lpm" --package-dir "$D5"
                                     check "plan: already installed"            1 err "already registered"
 
 # Scenario E: an installed dependency satisfies the plan.
-R12="$P5/root-installed"; mkdir "$R12"
+R12="$P5/root-installed"; mkdir "$R12"; trust "$R12"
 run --root "$R12" install "$D5/libc-1.0.lpm";  check "install: libc alone"     0 out "Installed libc 1.0"
 run --root "$R12" plan "$D5/liba-1.2.lpm" --package-dir "$D5"
                                     check "plan: installed dep satisfied"      0 out "^  libc 1.0  \[direct dependency\]$"
@@ -433,7 +453,7 @@ cp "$D5"/*.lpm "$P5/corrupt/"
 tar -xzf "$D5/libc-1.0.lpm" -C "$T5"
 echo "tampered" > "$T5/payload/usr/share/libc/README"
 tar -czf "$P5/corrupt/libc-1.0.lpm" -C "$T5" metadata.txt manifest.txt payload
-R14="$P5/root-corrupt"; mkdir "$R14"
+R14="$P5/root-corrupt"; mkdir "$R14"; trust "$R14"
 run --root "$R14" install "$P5/corrupt/app-1.0.lpm" --package-dir "$P5/corrupt"
                                     check "install: corrupted dependency"      1 err "INTEGRITY FAILURE: libc 1.0: SHA-256 mismatch"
 if [ ! -e "$R14/usr" ] && [ ! -e "$R14/var/lib/lpm/installed/app.meta" ]
@@ -443,6 +463,94 @@ run --root "$R11" plan "$D5/app-1.0.lpm" --sha256 abc
                                     check "plan: rejects --sha256"             2 err "usage"
 run help;                           check "help: plan command"                 0 out "plan <file.lpm> \[--package-dir DIR\]  *Show the dependency plan"
 run help;                           check "help: --package-dir option"         0 out "--package-dir DIR  plan, install"
+
+
+# --- Milestone 6: Ed25519 signatures and trusted keys ------------------
+echo "Running Milestone 6 CLI tests"
+P6="$WORK/m6"
+mkdir -p "$P6/pkgs"
+openssl genpkey -algorithm ED25519 -out "$KEYS/other.pem" 2>/dev/null   # a stranger
+chmod 600 "$KEYS/other.pem"
+KID=$("$LPM" --root "$K4" key list | awk 'NR==2{print $1}')
+
+R15="$P6/root"; mkdir "$R15"
+run --root "$R15" key list;                 check "key: empty store"                   0 out "No trusted keys"
+run --root "$R15" key add "$KEYS/pub.pem";  check "key: add prints fingerprint"        0 out "Trusted key added: $KID (ed25519)"
+if [ -f "$R15/etc/lpm/trusted-keys/$KID.pub" ] && [ ! -e /etc/lpm/trusted-keys/$KID.pub ]
+then ok "key: stored under --root only"; else bad "key: stored under --root only"; fi
+run --root "$R15" key add "$KEYS/pub.pem";  check "key: duplicate refused"             1 err "already trusted"
+run --root "$R15" key add "$KEYS/priv.pem"; check "key: private key refused"           1 err "PRIVATE key"
+printf 'not a key\n' > "$P6/junk.pem"
+run --root "$R15" key add "$P6/junk.pem";   check "key: malformed key refused"         1 err "not a PEM public key"
+run --root "$R15" key list;                 check "key: list shows fingerprint"        0 out "^  $KID  ed25519$"
+run --root "$R15" key remove nothex;        check "key: bad id refused"                1 err "64 lowercase hex"
+run --root "$R15" key frob;                 check "key: unknown subcommand"            2 err "usage"
+
+# Packages: trusted, unsigned, stranger, tampered metadata.
+S6="$P6/src"; mkdir -p "$S6/payload/usr/share/demo"
+echo demo > "$S6/payload/usr/share/demo/README"
+printf 'name=demo\nversion=1.0\n' > "$S6/metadata.in"
+bash "$MKPKG" "$S6" "$P6/demo-unsigned.lpm" gz >/dev/null
+"$SIGN" "$KEYS/priv.pem" "$P6/demo-unsigned.lpm" "$P6/demo.lpm" >"$WORK/out" 2>"$WORK/err"; CODE=$?
+                                            check "sign: signs a package"              0 out "Signed demo 1.0 with Ed25519 key $KID"
+"$SIGN" "$KEYS/priv.pem" "$P6/demo-unsigned.lpm" "$P6/demo.lpm" >"$WORK/out" 2>"$WORK/err"; CODE=$?
+                                            check "sign: never overwrites"             1 err "must not exist"
+"$SIGN" "$KEYS/priv.pem" "$P6/demo.lpm" "$P6/twice.lpm" >"$WORK/out" 2>"$WORK/err"; CODE=$?
+                                            check "sign: refuses to sign twice"        1 err "already signed"
+"$SIGN" "$KEYS/other.pem" "$P6/demo-unsigned.lpm" "$P6/demo-other.lpm" >/dev/null
+if tar -tzf "$P6/demo.lpm" | head -3 | tr '\n' ' ' | grep -q "^metadata.txt manifest.txt signature.txt "
+then ok "sign: signature.txt is the third entry"; else bad "sign: signature.txt is the third entry"; fi
+if ! tar -xzOf "$P6/demo.lpm" signature.txt | grep -q PRIVATE; then ok "sign: no private key in package"
+else bad "sign: no private key in package"; fi
+
+run --root "$R15" verify "$P6/demo.lpm";          check "verify: trusted => exit 0"   0 out "AUTHENTICATED: signed by a trusted key"
+                                                  check "verify: shows signing key"   0 out "Signing key:    $KID"
+run --root "$R15" verify "$P6/demo-unsigned.lpm"; check "verify: unsigned => exit 3"  3 out "Signature:      none (unsigned)"
+run --root "$R15" verify "$P6/demo-other.lpm";    check "verify: stranger => exit 3"  3 out "Trust:          NOT trusted"
+                                                  check "verify: stranger sig valid"  3 out "Signature:      Ed25519, valid"
+T6="$P6/t"; mkdir "$T6"; tar -xzf "$P6/demo.lpm" -C "$T6"
+sed -i 's/^version=1.0$/version=9.0/' "$T6/metadata.txt"
+tar -czf "$P6/demo-tampered.lpm" -C "$T6" metadata.txt manifest.txt signature.txt payload
+run --root "$R15" verify "$P6/demo-tampered.lpm"; check "verify: tampered metadata => 1" 1 out "Signature:      Ed25519, INVALID"
+                                                  check "verify: tamper reported"     1 err "AUTHENTICATION FAILURE"
+run verify "$P6/demo.lpm";                        check "verify: host store not used" 3 out "NOT trusted"
+
+run --root "$R15" install "$P6/demo-unsigned.lpm"; check "install: unsigned refused"  1 err "AUTHENTICATION FAILURE: demo 1.0: the package is not signed"
+run --root "$R15" install "$P6/demo-other.lpm";    check "install: untrusted refused" 3 err "is not trusted"
+run --root "$R15" install "$P6/demo-tampered.lpm"; check "install: tampered refused"  1 err "invalid signature"
+if [ ! -e "$R15/usr" ]; then ok "install: refusals installed nothing"; else bad "install: refusals installed nothing"; fi
+run --root "$R15" install "$P6/demo.lpm";          check "install: trusted installs"  0 out "Authenticated demo 1.0: Ed25519 signature by trusted key"
+run --root "$R15" key remove "$KID";               check "key: remove"                0 out "Removed trusted key $KID"
+run --root "$R15" list;                            check "key: removal keeps installed" 0 out "demo  *1.0"
+
+# Dependencies: every package must be authenticated.
+R16="$P6/root-deps"; mkdir "$R16"; trust "$R16"
+OUTDIR="$P6/pkgs"
+mkdep libc 1.0; mkdep liba 1.0 'libc>=1.0'; mkdep libb 1.0 'libc>=1.0'
+mkdep app 1.0 'liba>=1.0' 'libb>=1.0'
+OUTDIR=
+mv "$P6/pkgs/libb-1.0.lpm" "$P6/libb-good.lpm"
+mkdir -p "$P6/lb"; tar -xzf "$P6/libb-good.lpm" -C "$P6/lb"
+tar -czf "$P6/libb-unsigned.lpm" -C "$P6/lb" metadata.txt manifest.txt payload
+"$SIGN" "$KEYS/other.pem" "$P6/libb-unsigned.lpm" "$P6/pkgs/libb-1.0.lpm" >/dev/null
+run --root "$R16" install "$P6/pkgs/app-1.0.lpm" --package-dir "$P6/pkgs"
+                                            check "deps: untrusted libb rejects all"   3 err "libb 1.0: signing key .* is not trusted"
+if [ ! -e "$R16/usr" ] && [ "$("$LPM" --root "$R16" list)" = "No packages installed." ]
+then ok "deps: nothing installed"; else bad "deps: nothing installed"; fi
+cp "$P6/libb-good.lpm" "$P6/pkgs/libb-1.0.lpm"
+run --root "$R16" install "$P6/pkgs/app-1.0.lpm" --package-dir "$P6/pkgs"
+                                            check "deps: all trusted installs"         0 out "Authenticated libc 1.0"
+run --root "$R16" list;                     check "deps: four packages"                0 out "Installed packages (4)"
+
+# A trusted package may still not write into LPM's protected areas.
+S7="$P6/src-evil"; mkdir -p "$S7/payload/etc/lpm/trusted-keys"
+cp "$KEYS/pub.pem" "$S7/payload/etc/lpm/trusted-keys/evil.pub"
+printf 'name=evil\nversion=1.0\n' > "$S7/metadata.in"
+bash "$MKPKG" "$S7" "$P6/evil.lpm" gz >/dev/null; sign_in_place "$P6/evil.lpm"
+run --root "$R16" install "$P6/evil.lpm";   check "install: trust store protected"     1 err "protected area"
+if [ ! -e "$R16/etc/lpm/trusted-keys/evil.pub" ]; then ok "install: no key planted"; else bad "install: no key planted"; fi
+
+run help;                                   check "help: key command"                  0 out "key list | add FILE.pem | remove KEY_ID"
 
 echo
 echo "Results: $PASS passed, $FAIL failed"

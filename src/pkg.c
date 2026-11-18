@@ -22,6 +22,8 @@ void lpm_pkg_init(lpm_pkg *p)
 {
     lpm_package_init(&p->meta);
     p->metadata_raw = NULL;
+    p->signature_raw = NULL;
+    p->signature_len = 0;
     p->metadata_len = 0;
     lpm_manifest_init(&p->manifest);
     p->payload_bytes = 0;
@@ -33,6 +35,7 @@ void lpm_pkg_free(lpm_pkg *p)
         return;
     lpm_package_free(&p->meta);
     free(p->metadata_raw);
+    free(p->signature_raw);
     lpm_manifest_free(&p->manifest);
     lpm_pkg_init(p);
 }
@@ -351,11 +354,28 @@ lpm_status lpm_pkg_read(int fd, int stage_fd, lpm_pkg *out, lpm_meta_error *err)
         lpm_meta_error_set(err, LPM_META_ERR_NOMEM, 0, NULL, "out of memory");
         goto out;
     }
-    for (;;) {
+    for (bool first = true;; first = false) {
         bool end;
         rc = lpm_archive_next(a, &e, &end, err);
         if (rc != LPM_OK || end)
             break;
+        /* Milestone 6: an optional signature.txt, only as the entry right
+         * after manifest.txt. Its bytes are kept as they are; checking them
+         * is trust.c's job. Anywhere else (e.g. a second copy) it is an
+         * unexpected entry and the package is rejected. */
+        if (first && strcmp(e.path, LPM_PKG_SIGNATURE) == 0) {
+            if (e.type != LPM_AENTRY_FILE) {
+                lpm_meta_error_set(err, LPM_META_ERR_SIG_MALFORMED, 0, NULL,
+                                   "signature.txt must be a regular file");
+                rc = LPM_ERR_SIGNATURE;
+                break;
+            }
+            rc = read_small(a, &e, LPM_PKG_SIGNATURE_MAX, &p.signature_raw,
+                            &p.signature_len, err);
+            if (rc != LPM_OK)
+                break;
+            continue;
+        }
         rc = payload_entry(a, &p, &e, seen, stage_fd, err);
         if (rc != LPM_OK)
             break;

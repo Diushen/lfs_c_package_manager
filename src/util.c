@@ -146,6 +146,8 @@ const char *lpm_status_str(lpm_status status)
     case LPM_ERR_INTEGRITY:       return "integrity check failed";
     case LPM_ERR_CRYPTO:          return "cryptographic library error";
     case LPM_ERR_DEPENDENCY:      return "dependency resolution failed";
+    case LPM_ERR_SIGNATURE:       return "signature check failed";
+    case LPM_ERR_UNTRUSTED:       return "signer is not trusted";
     }
     return "unknown error";
 }
@@ -156,5 +158,7 @@ int lpm_status_to_exit(lpm_status status)
         return 0;
     if (status == LPM_ERR_USAGE)
         return 2;
+    if (status == LPM_ERR_UNTRUSTED)
+        return 3;   /* intact but not authenticated (Milestone 6) */
     return 1;
 }

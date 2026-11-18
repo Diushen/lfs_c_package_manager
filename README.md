@@ -16,11 +16,13 @@ system.
 | 3         | Version comparison, locked atomic database writes, file ownership, `check` | done |
 | 4         | Package archives (libarchive), SHA-256 integrity (OpenSSL), `verify`, `install` | done |
 | 5         | Dependency graph: version constraints, cycle detection, topological order, `plan`, multi-package `install` | done |
-| 6–12      | Ed25519 signatures, remove, ... | planned |
+| 6         | Ed25519 signatures, trusted-key store (`key`), authenticated `verify` and `install` | done |
+| later     | `remove`, upgrades, installing into the real `/` | planned |
 
-`lpm install` checks **integrity** (SHA-256), not **authenticity**: until
-Ed25519 signatures arrive it refuses to install into the real `/` and only
-works with `--root DIR`. `lpm remove` is not implemented yet.
+`lpm install` now requires **integrity** (SHA-256) **and authenticity** (an
+Ed25519 signature by a key in the root's trust store), for every package it
+installs. It still refuses the real `/`: that final step is left for LFS
+integration. `lpm remove` is not implemented yet.
 
 ## Build and test
 
@@ -60,6 +62,8 @@ allocation failures and, for the database, system-call failures.
     lpm verify hello.lpm [--sha256 HEX]
     lpm --root ./demo-root install hello.lpm [--sha256 HEX] [--package-dir DIR]
     lpm --root ./demo-root plan app.lpm [--package-dir DIR]
+    lpm --root ./demo-root key add publisher.pub | key list | key remove KEY_ID
+    build/lpm-sign private.pem unsigned.lpm signed.lpm
 
 ## Layout
 
@@ -78,11 +82,14 @@ allocation failures and, for the database, system-call failures.
       install.h         verify / install pipeline (multi-package in M5)  (M4, M5)
       solver.h          dependency graph, cycles, topological order     (M5)
       plan.h            gathers candidates + installed set for solver   (M5)
+      signature.h       Ed25519 keys, signatures, signature record      (M6)
+      trust.h           trusted-key store, authentication decision      (M6)
       commands.h        command table
     src/                implementation of each header + main.c
     tools/
       lpm-db-demo.c     demonstration driver for the database API       (M3)
       lpm-mkpkg.sh      builds .lpm packages (bash, coreutils, GNU tar)  (M4)
+      lpm-sign.c        signs a .lpm with an Ed25519 private key         (M6)
     tests/
       run_tests.sh      CLI tests (Milestones 1-5)
       test_framework.h  tiny shared test framework                      (M3)
@@ -95,6 +102,9 @@ allocation failures and, for the database, system-call failures.
       test_install.c    end-to-end install, tampering, faults, crashes  (M4)
       test_solver.c     solver algorithms on in-memory packages         (M5)
       test_deps.c       planning + multi-package install, end to end    (M5)
+      test_signature.c  Ed25519, RFC 8032 vectors, signature record     (M6)
+      test_auth.c       trust store, authentication, signed installs    (M6)
+      test_signing.h    ephemeral test keys (no key is ever committed)  (M6)
       fixtures/         example valid/invalid metadata files            (M2)
     examples/           demonstration packages (later milestones)
 
@@ -1210,3 +1220,278 @@ mk cyc-a 1 'cyc-b>=1'; mk cyc-b 1 'cyc-c>=1'; mk cyc-c 1 'cyc-a>=1'
 ./lpm --root $(mktemp -d) plan $C/cyc-a-1.lpm --package-dir $C   # cyc-a -> cyc-b -> cyc-c -> cyc-a
 P=$P0
 ```
+
+---
+
+## Ed25519 signatures and trusted keys (Milestone 6)
+
+### Why SHA-256 alone is not enough
+
+The SHA-256 values in `metadata.txt` and `manifest.txt` prove the package is
+**internally consistent**. Anyone who changes a file can recompute every
+hash, so they say nothing about **who** made the package.
+
+A digital signature does. Only the holder of a private key can produce a
+signature that verifies with the matching public key. LPM accepts a package
+only if that public key is one you explicitly trusted.
+
+**Why Ed25519:**
+* small keys and signatures (32 and 64 bytes);
+* deterministic, with no random number needed while signing;
+* fast, and resistant to many implementation mistakes;
+* available in OpenSSL, which LPM already uses.
+
+### The trust chain
+
+```
+  trusted public key   (<root>/etc/lpm/trusted-keys, added by you)
+          |  Ed25519 verifies
+          v
+  metadata.txt         name, version, dependencies, manifest_sha256
+          |  manifest_sha256
+          v
+  manifest.txt         path, mode and SHA-256 of every file
+          |  per-file SHA-256
+          v
+  payload/...          every installed byte
+```
+
+### Exactly what is signed
+
+```
+LPM-SIGNED-METADATA-V1\n  ||  the raw bytes of metadata.txt
+```
+
+* **The prefix is domain separation.** A signature made for LPM metadata
+  can't be valid for anything else, and a future format can change the
+  prefix.
+* **Metadata is signed exactly as stored**, never reconstructed.
+* **The signature covers identity.** Changing the name, version or
+  dependencies invalidates it.
+* **Pure Ed25519.** There is no separate digest step: OpenSSL's one-shot
+  `EVP_DigestSign` and `EVP_DigestVerify` are used, as Ed25519 requires.
+* **The signature isn't part of the signed data**, so nothing is circular.
+
+### Package format
+
+```
+example-1.0.lpm            tar (plain, gzip or xz)
+├── metadata.txt           1st entry (Milestone 2)
+├── manifest.txt           2nd entry (Milestone 4)
+├── signature.txt          3rd entry (Milestone 6)
+└── payload/...
+```
+
+`signature.txt` has exactly five lines, in this order, in lowercase hex:
+
+```
+format=lpm-signature-v1
+algorithm=ed25519
+public_key=<64 hex digits: the signer's raw public key>
+key_id=<64 hex digits: SHA-256 of that public key>
+signature=<128 hex digits: the 64-byte signature>
+```
+
+**Rejected as malformed:**
+* a second `signature.txt`, or one anywhere other than third;
+* any other layout;
+* another format or algorithm;
+* a `key_id` that isn't the hash of `public_key`.
+
+**Old packages:** unsigned packages remain readable. `verify` reports them
+as unsigned, and `install` refuses them.
+
+**The embedded `public_key` is never trusted.** It only lets `verify` say
+whether the signature is mathematically valid. Installation verifies the
+signature again with the *trusted copy* of the key from the trust store.
+
+### Key IDs and the trust store
+
+* **Key ID:** lowercase hex SHA-256 of the 32 raw public-key bytes. Because
+  it's derived from the key, nobody can choose an ID that names somebody
+  else's key.
+* **Storage:**
+  - Each trusted key is stored at `<root>/etc/lpm/trusted-keys/<key_id>.pub`,
+    in canonical PEM.
+  - The store belongs to `--root`: a test root never sees the host's keys,
+    and the reverse.
+* **Safety checks:**
+  - Every directory is opened without following symlinks, and must belong to
+    you or root and not be group- or world-writable.
+  - A key file whose content doesn't hash to its file name is rejected as
+    tampered.
+
+```sh
+lpm --root R key add publisher.pub   # validate, show the fingerprint, store
+lpm --root R key list
+lpm --root R key remove KEY_ID       # "revocation": stops future installs
+```
+
+**Rules for `key add`:**
+* It accepts exactly one Ed25519 public key in PEM.
+* It refuses private keys, other key types, garbage and duplicates.
+* It writes atomically: a temporary file, `fsync`, then `linkat`, which
+  never overwrites.
+* Changes happen under the database's exclusive lock, which the installer
+  also holds.
+
+**What packages can't do:**
+* Packages can't add keys: install refuses any path under `/etc/lpm` or
+  `/var/lib/lpm`, even in a trusted package.
+* A key embedded in a package is never imported.
+
+### Signing packages
+
+```sh
+openssl genpkey -algorithm ED25519 -out private.pem   # keep secret, chmod 600
+openssl pkey -in private.pem -pubout -out public.pem  # give this to users
+tools/lpm-mkpkg.sh SRCDIR unsigned.lpm
+build/lpm-sign private.pem unsigned.lpm signed.lpm
+```
+
+**What `lpm-sign` checks:** it refuses to sign a package with invalid
+metadata or a manifest that doesn't match. It also refuses an
+already-signed package, and an output file that already exists.
+
+**Private keys:**
+* `lpm-sign` never prints the private key, and wipes its copy after use. It
+  warns if the key file is readable by others.
+* Private keys belong nowhere near packages, roots or Git. `.gitignore`
+  excludes `*.pem`.
+* Development keys are for testing, not production trust anchors.
+
+### `lpm verify`
+
+`lpm [--root R] verify FILE.lpm [--sha256 HEX]` checks integrity as in
+Milestone 4. It then checks authenticity against the trust store of
+`--root` (default `/`, i.e. `/etc/lpm/trusted-keys`). Signature validity and
+trust are reported separately:
+
+```
+Authentication (trust store: R/etc/lpm/trusted-keys):
+  Signature:      Ed25519, valid
+  Signing key:    31b0d44e...
+  Trust:          trusted
+Result:           INTEGRITY OK, AUTHENTICATED: signed by a trusted key ...
+```
+
+| Exit | Meaning |
+|------|---------|
+| 0 | intact and signed by a trusted key: installable |
+| 1 | tampered: an integrity failure, or a malformed or invalid signature |
+| 3 | intact but **not authenticated**: unsigned, or the signer is not trusted |
+
+A valid signature from an unknown key exits with 3 and is never called
+authenticated.
+
+### Installation policy
+
+1. Plan the dependencies. Metadata used for planning is still unverified, so
+   it's provisional only.
+2. For **every** selected package, from the same open file descriptor:
+   integrity (Milestone 4), then the signature by a **trusted** key over the
+   exact `metadata.txt` bytes just read, then a check that the verified
+   metadata equals the planned metadata.
+3. Pre-flight the whole set, including the protected-path rule.
+4. Commit in dependency order, all or nothing (Milestone 5).
+
+If any package fails at step 2, whether unsigned, invalid, untrusted or
+tampered, nothing is installed and nothing is registered. The error names
+the package. There is no bypass flag, for any root. The real `/` is still
+refused.
+
+### Threat model
+
+**Defended:**
+* tampering with the payload, manifest or metadata;
+* forged, malformed or duplicated signatures;
+* unknown signers, and borrowed key IDs;
+* tampered trust-store files;
+* swapping a package between planning and installation;
+* sneaking an untrusted package in as a dependency;
+* packages planting keys;
+* and all Milestone 4 archive attacks.
+
+**Not defended:**
+* A trusted publisher who is compromised, or whose key is stolen, or who
+  deliberately signs something malicious. A signature proves origin, not
+  safety.
+* **Replay of an old, validly signed version:** there are no expiry dates
+  and no timestamping.
+* **Revocation is local:** you remove the key yourself; there is no online
+  revocation list.
+* Bugs in LPM itself.
+
+### Compatibility
+
+* **OpenSSL:** 1.1.1 or 3.x, through the EVP interface (`EVP_PKEY_ED25519`,
+  `EVP_DigestSign`/`EVP_DigestVerify`, `EVP_PKEY_new_raw_public_key`). These
+  are non-deprecated in both. Tested with OpenSSL 1.1.1f in WSL; not yet with
+  OpenSSL 3 on LFS.
+* **New external dependencies:** none.
+* **Test tools:** the CLI tests also need the `openssl` command, to make
+  throw-away keys.
+
+### Tests
+
+| Program | Tests | Covers |
+|---------|-------|--------|
+| `build/test_signature` | 9 | RFC 8032 test vectors 1–3, signing and verifying; wrong key; changed message; every flipped signature bit; empty message; domain separation; key lengths and IDs; PEM import, including private, X25519, garbage and two-key files; every malformation of the signature record; allocation failures |
+| `build/test_auth` | 20 | key import, fingerprint, duplicates, list, remove, unknown keys; tampered and symlinked stores; separate stores per root; failures during key import; every package outcome; key-ID substitution; removed keys; dependencies that are unsigned, untrusted or tampered; several signers; substitution during install; protected paths; real-root refusal; every single failure of a signed four-package install |
+| `tests/run_tests.sh` | 36 new | `key`, `lpm-sign`, `verify` exit codes 0/1/3, authenticated install, untrusted dependency, trust-store protection |
+
+### Demonstration (temporary directories only)
+
+```sh
+make && make demo                        # builds lpm and build/lpm-sign
+D=$(mktemp -d); R=$D/root; mkdir -p $R $D/pkgs
+
+# A. keys: the private key signs (keep it secret), the public key verifies
+openssl genpkey -algorithm ED25519 -out $D/priv.pem; chmod 600 $D/priv.pem
+openssl pkey -in $D/priv.pem -pubout -out $D/pub.pem
+openssl genpkey -algorithm ED25519 -out $D/stranger.pem; chmod 600 $D/stranger.pem
+
+# B. build + sign: mk NAME VERSION [DEPENDS...]  (K = signing key, OUT = directory)
+mk() { s=$(mktemp -d); mkdir -p $s/payload/usr/share/$1
+       echo "$1 $2" > $s/payload/usr/share/$1/README
+       printf 'name=%s\nversion=%s\n' $1 $2 > $s/metadata.in; n=$1; v=$2; shift 2
+       for d in "$@"; do echo "depends=$d" >> $s/metadata.in; done
+       tools/lpm-mkpkg.sh $s $s.lpm gz >/dev/null
+       build/lpm-sign ${K:-$D/priv.pem} $s.lpm ${OUT:-$D/pkgs}/$n-$v.lpm; rm -rf $s $s.lpm; }
+mk libc 1.0; mk liba 1.0 'libc>=1.0'; mk libb 1.0 'libc>=1.0'; mk app 1.0 'liba>=1.0' 'libb>=1.0'
+tar -tzf $D/pkgs/app-1.0.lpm | head -3          # metadata.txt manifest.txt signature.txt
+
+# C. trust the publisher's public key in the temporary root
+./lpm --root $R key add $D/pub.pem
+./lpm --root $R key list
+
+# D. verify: integrity + signature + trust            -> exit 0
+./lpm --root $R verify $D/pkgs/app-1.0.lpm; echo "exit $?"
+
+# E. tamper with the metadata without re-signing         -> exit 1, INVALID
+T=$(mktemp -d); tar -xzf $D/pkgs/libc-1.0.lpm -C $T
+sed -i 's/^version=1.0$/version=9.0/' $T/metadata.txt
+tar -czf $D/tampered.lpm -C $T metadata.txt manifest.txt signature.txt payload
+./lpm --root $R verify $D/tampered.lpm; echo "exit $?"
+
+# F. a package from an unknown signer                     -> exit 3, NOT trusted
+K=$D/stranger.pem OUT=$D mk solo 1.0
+./lpm --root $R verify $D/solo-1.0.lpm; echo "exit $?"
+
+# G. authenticated dependency installation
+./lpm --root $R plan $D/pkgs/app-1.0.lpm --package-dir $D/pkgs
+./lpm --root $R install $D/pkgs/app-1.0.lpm --package-dir $D/pkgs
+./lpm --root $R list
+
+# H. one dependency signed by the stranger: everything is refused
+R2=$D/root2; mkdir -p $R2 $D/evil; ./lpm --root $R2 key add $D/pub.pem
+cp $D/pkgs/libc-1.0.lpm $D/pkgs/liba-1.0.lpm $D/pkgs/app-1.0.lpm $D/evil/
+K=$D/stranger.pem OUT=$D/evil mk libb 1.0 'libc>=1.0'
+./lpm --root $R2 install $D/evil/app-1.0.lpm --package-dir $D/evil; echo "exit $?"
+./lpm --root $R2 list                                   # No packages installed.
+ls $R2                                                  # etc var: no usr
+```
+
+**Direct vs. transitive dependencies:** in the `plan` output, `liba` and
+`libb` are marked direct, because `app` names them. `libc` is marked
+transitive, needed only through them. It appears once and is installed first.

@@ -44,6 +44,15 @@ lpm_status lpm_safe_open_dir(int base_fd, const char *rel, bool create,
                              lpm_meta_error *err);
 
 /*
+ * Milestone 6: like lpm_safe_open_dir(), for security-sensitive
+ * directories (the trusted-key store). Every component must also be
+ * owned by the current user or root and not be writable by group or
+ * others, otherwise LPM_ERR_INVALID (LPM_META_ERR_UNTRUSTED).
+ */
+lpm_status lpm_safe_open_trusted_dir(int base_fd, const char *rel, bool create,
+                                     mode_t mode, int *out_fd, lpm_meta_error *err);
+
+/*
  * Split "a/b/c" into parent "a/b" (written to parent, "" for a top-level
  * name) and base "c" (a pointer into rel). LPM_ERR_INVALID if the
  * parent does not fit.

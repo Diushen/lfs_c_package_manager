@@ -168,6 +168,54 @@ lpm_status lpm_safe_open_dir(int base_fd, const char *rel, bool create,
     return LPM_OK;
 }
 
+lpm_status lpm_safe_open_trusted_dir(int base_fd, const char *rel, bool create,
+                                     mode_t mode, int *out_fd, lpm_meta_error *err)
+{
+    char comp[LPM_FILES_MAX_COMPONENT + 1];
+    size_t pos = 0, len = strlen(rel);
+    lpm_status rc;
+    int fd;
+
+    *out_fd = -1;
+    rc = lpm_safe_open_dir(base_fd, "", false, 0, NULL, &fd, err);
+    if (rc != LPM_OK)
+        return rc;
+    while (pos < len) {
+        size_t clen = strcspn(rel + pos, "/");
+        struct stat st;
+        int next;
+
+        if (clen == 0 || clen > LPM_FILES_MAX_COMPONENT) {
+            close(fd);
+            lpm_meta_error_set(err, LPM_META_ERR_INVALID_PATH, 0, "path",
+                               "invalid path '%.200s'", rel);
+            return LPM_ERR_INVALID;
+        }
+        memcpy(comp, rel + pos, clen);
+        comp[clen] = '\0';
+        rc = lpm_safe_open_dir(fd, comp, create, mode, NULL, &next, err);
+        close(fd);
+        if (rc != LPM_OK)
+            return rc;
+        fd = next;
+        if (fstat(fd, &st) != 0 ||
+            (st.st_uid != geteuid() && st.st_uid != 0) ||
+            (st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+            lpm_meta_error_set(err, LPM_META_ERR_UNTRUSTED, 0, NULL,
+                               "'%.*s' is not owned by you or root, or is writable "
+                               "by group or others; refusing to trust it",
+                               (int)(pos + clen), rel);
+            close(fd);
+            return LPM_ERR_INVALID;
+        }
+        pos += clen;
+        if (rel[pos] == '/')
+            pos++;
+    }
+    *out_fd = fd;
+    return LPM_OK;
+}
+
 void lpm_safe_rollback(int base_fd, lpm_path_log *log)
 {
     size_t i = log->count;
